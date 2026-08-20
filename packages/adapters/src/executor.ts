@@ -3,6 +3,7 @@ import type {
   AgentHomeStore,
   AgentModelOAuthCredential,
   AgentRuntime,
+  ArtifactStore,
   ComputerRef,
   ConnectorProvider,
   JobPublisher,
@@ -11,16 +12,19 @@ import type {
   NotificationProvider,
   SandboxProvider,
 } from "@rakazo/adapter-kit";
-import { routineWakeupJob, runContinueJob } from "@rakazo/adapter-kit";
+import { historyCompactJob, routineWakeupJob, runContinueJob } from "@rakazo/adapter-kit";
 import type { MessageBlock, RunStatus } from "@rakazo/contracts";
+import { ATTACHMENT_MAX_BYTES, isAttachmentImageMimeType } from "@rakazo/contracts";
 import {
   appendTextSegment,
   appendToolCallSegment,
   assertTransition,
+  blocksToAgentHistoryText,
   containsSecret,
   createStreamingRedactor,
   endsSentence,
   humanizeToolName,
+  inferAttachmentMimeType,
   isTerminal,
   nextCronDate,
   nextFence,
@@ -30,6 +34,7 @@ import {
   type ToolNameStreak,
   trackToolCallStreak,
   trackToolNameStreak,
+  userTurnBlocksForRun,
 } from "@rakazo/core";
 import {
   createThreadMessage,
@@ -43,7 +48,13 @@ import {
 } from "@rakazo/db";
 import { builtinAgentTools } from "./builtin-tools.js";
 import { archiveSpawnedBot, spawnBot } from "./child-bots.js";
-import { collectLogIds } from "./composio-connector.js";
+import {
+  collectLogIds,
+  mergeConnectedPlugins,
+  needsLivePluginSync,
+  type PluginConnectionRow,
+  planLiveConnectionSync,
+} from "./composio-connector.js";
 import { scheduleComputerSleep } from "./computer-idle.js";
 import {
   acquireComputerExecutionLease,
@@ -64,6 +75,14 @@ import {
 } from "./computer-support.js";
 import { observationToolResult, parseComputerActions } from "./computer-tools.js";
 import { checkpointAndRecordComputerWorkspace } from "./computer-workspace.js";
+import {
+  COMPACTION_BATCH_SIZE,
+  formatRecalledMemory,
+  HISTORY_WINDOW_SIZE,
+  historyWindowSize,
+  LEGACY_HISTORY_WINDOW_SIZE,
+  shouldEnqueueCompaction,
+} from "./history-compaction.js";
 import { loadAgentMemoryContext } from "./memory-context.js";
 import { selectMemoryTools } from "./memory-tools.js";
 import { toOAuthCredential } from "./pi-credentials.js";
@@ -75,7 +94,16 @@ import {
 } from "./pi-oauth.js";
 import { inferScript } from "./scripted-runtime.js";
 import type { EncryptedSecretStore } from "./secrets.js";
-import { saveSupermemoryMemory, searchSupermemory } from "./supermemory-client.js";
+import {
+  saveSupermemoryMemory,
+  searchSupermemory,
+  supermemoryContainerTag,
+} from "./supermemory-client.js";
+import {
+  attachWorkspaceFileToThread,
+  currentTurnFilesInstruction,
+  materializeCurrentTurnFiles,
+} from "./thread-artifacts.js";
 
 const modelCredentialLocks = new Map<string, Promise<void>>();
 const READ_ONLY_AGENT_TOOLS = new Set([
@@ -87,7 +115,6 @@ const READ_ONLY_AGENT_TOOLS = new Set([
   "recall_memory",
 ]);
 const MAX_MODEL_FILE_BYTES = 250_000;
-const MAX_AGENT_HISTORY_MESSAGES = 200;
 // Same tool, same arguments, this many times in a row means the agent is stuck, not paginating.
 const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS = 6;
 // Backstop for a stuck agent that varies its arguments each call (so the exact-match cap above
@@ -107,6 +134,7 @@ export interface ExecutorDeps {
   sandbox: SandboxProvider;
   memory: MemoryStore;
   home: AgentHomeStore;
+  artifacts?: ArtifactStore;
   connector?: ConnectorProvider;
   secrets: string[];
   secretStore?: EncryptedSecretStore;
@@ -114,6 +142,7 @@ export interface ExecutorDeps {
   dataDir?: string;
   notifications?: NotificationProvider;
   jobs: JobPublisher;
+  listConnectedPluginSlugs?: (userId: string) => Promise<string[]>;
 }
 
 export async function deferFutureRoutine(
@@ -124,6 +153,47 @@ export async function deferFutureRoutine(
   if (scheduledAt.getTime() <= Date.now() + 1_000) return false;
   await jobs.enqueue(routineWakeupJob(routineId, scheduledAt));
   return true;
+}
+
+async function loadLivePluginSlugs(
+  listConnectedPluginSlugs: ExecutorDeps["listConnectedPluginSlugs"],
+  userId: string,
+): Promise<{ ok: true; slugs: string[] } | { ok: false }> {
+  if (!listConnectedPluginSlugs) return { ok: false };
+  try {
+    return { ok: true, slugs: await listConnectedPluginSlugs(userId) };
+  } catch {
+    return { ok: false };
+  }
+}
+
+async function persistLivePluginConnections(
+  prisma: PrismaClient,
+  owner: { userId: string; workspaceId: string },
+  rows: PluginConnectionRow[],
+  liveSlugs: string[],
+): Promise<void> {
+  const sync = planLiveConnectionSync(rows, liveSlugs);
+  if (sync.connectIds.length > 0) {
+    await prisma.connection.updateMany({
+      where: {
+        id: { in: sync.connectIds },
+        userId: owner.userId,
+        workspaceId: owner.workspaceId,
+      },
+      data: { status: "connected" },
+    });
+  }
+  if (sync.revokeIds.length > 0) {
+    await prisma.connection.updateMany({
+      where: {
+        id: { in: sync.revokeIds },
+        userId: owner.userId,
+        workspaceId: owner.workspaceId,
+      },
+      data: { status: "revoked" },
+    });
+  }
 }
 
 export function createRunExecutor(deps: ExecutorDeps) {
@@ -284,7 +354,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
 
       const runSecrets = [...deps.secrets];
       try {
-        const [bot, thread, messages, task, connectedPlugins, credential, settings, memoryConfig] =
+        const [bot, thread, messages, task, storedConnections, credential, settings, memoryConfig] =
           await Promise.all([
             deps.prisma.bot.findUniqueOrThrow({
               where: { id: run.botId },
@@ -294,13 +364,13 @@ export function createRunExecutor(deps: ExecutorDeps) {
             deps.prisma.message.findMany({
               where: { threadId: run.threadId },
               orderBy: { seq: "desc" },
-              take: MAX_AGENT_HISTORY_MESSAGES,
-              select: { role: true, blocks: true },
+              take: LEGACY_HISTORY_WINDOW_SIZE,
+              select: { role: true, runId: true, blocks: true },
             }),
             deps.prisma.task.findUniqueOrThrow({ where: { id: run.taskId } }),
             deps.prisma.connection.findMany({
-              where: { userId: run.userId, workspaceId: run.workspaceId, status: "connected" },
-              select: { provider: true, displayName: true },
+              where: { userId: run.userId, workspaceId: run.workspaceId },
+              select: { id: true, provider: true, displayName: true, status: true },
             }),
             findDefaultModelCredential(deps.prisma, run),
             deps.prisma.deploymentSettings.findUnique({ where: { id: "default" } }),
@@ -308,6 +378,20 @@ export function createRunExecutor(deps: ExecutorDeps) {
           ]);
         runAbortController = new AbortController();
         if (!leaseValid) runAbortController.abort();
+        let liveSlugs: string[] = [];
+        if (needsLivePluginSync(storedConnections)) {
+          const listing = await loadLivePluginSlugs(deps.listConnectedPluginSlugs, run.userId);
+          if (listing.ok) {
+            liveSlugs = listing.slugs;
+            await persistLivePluginConnections(
+              deps.prisma,
+              run,
+              storedConnections,
+              listing.slugs,
+            ).catch(() => undefined);
+          }
+        }
+        const connectedPlugins = mergeConnectedPlugins(storedConnections, liveSlugs);
         const context = {
           operationId: runId,
           traceId: runId,
@@ -319,6 +403,23 @@ export function createRunExecutor(deps: ExecutorDeps) {
           signal: runAbortController.signal,
           connectedProviders: connectedPlugins.map((row) => row.provider),
         };
+        const supermemory = memoryConfig
+          ? {
+              baseUrl: memoryConfig.baseUrl,
+              apiKey: deps.secretStore!.load(
+                (
+                  await deps.prisma.secret.findUniqueOrThrow({
+                    where: { id: memoryConfig.secretId },
+                  })
+                ).ciphertext,
+              ),
+              containerTag: supermemoryContainerTagFor(
+                effectiveMemoryScope(bot.memoryScope, memoryConfig.defaultMemoryScope),
+                bot.id,
+                run.workspaceId,
+              ),
+            }
+          : null;
 
         await deps.events.append({
           workspaceId: run.workspaceId,
@@ -330,14 +431,47 @@ export function createRunExecutor(deps: ExecutorDeps) {
         });
 
         const discovered = deps.connector ? await deps.connector.discoverTools(context) : [];
-        const history = [...messages].reverse().map((m) => ({
+        let history = [...messages].reverse().map((m) => ({
           role: (m.role === "user" ? "user" : m.role === "system" ? "system" : "assistant") as
             | "user"
             | "assistant"
             | "system",
-          content: blocksToText(m.blocks as MessageBlock[]),
+          content: blocksToAgentHistoryText(m.blocks as MessageBlock[]),
         }));
+        const turnBlocks = userTurnBlocksForRun(
+          run.trigger,
+          runId,
+          messages.map((message) => ({
+            role: message.role,
+            runId: message.runId,
+            blocks: message.blocks as MessageBlock[],
+          })),
+        );
+        const currentTurnImages = await loadCurrentTurnImages(deps, turnBlocks, context);
         const memoryContext = await loadAgentMemoryContext(deps.memory, bot.id, context);
+        const supermemoryEnabled = Boolean(supermemory);
+        let recalledMemory = "";
+        let recallSucceeded = false;
+        if (supermemory && thread.historyCompactedUpToSeq != null) {
+          const recalled = await searchSupermemory(
+            task.prompt,
+            supermemoryContainerTag(bot.id),
+            supermemory,
+          );
+          if (recalled.ok) {
+            recallSucceeded = true;
+            recalledMemory = formatRecalledMemory(recalled.results);
+          } else {
+            console.error("supermemory recall failed", recalled.error);
+          }
+        }
+        history = history.slice(
+          -historyWindowSize({
+            supermemoryEnabled,
+            compacted: thread.historyCompactedUpToSeq != null,
+            recallSucceeded,
+          }),
+        );
         const resolved = await resolveModelKey(
           deps,
           run.userId,
@@ -346,26 +480,20 @@ export function createRunExecutor(deps: ExecutorDeps) {
           (values) => runSecrets.push(...values),
         );
         runSecrets.push(...resolved.redact);
-        const supermemory = memoryConfig
-          ? {
-              baseUrl: memoryConfig.baseUrl,
-              apiKey: deps.secretStore!.load(
-                (await deps.prisma.secret.findUniqueOrThrow({ where: { id: memoryConfig.secretId } }))
-                  .ciphertext,
-              ),
-              containerTag: supermemoryContainerTagFor(
-                effectiveMemoryScope(bot.memoryScope, memoryConfig.defaultMemoryScope),
-                bot.id,
-                run.workspaceId,
-              ),
-            }
-          : null;
         if (!bot.computer) throw new Error("Bot has no computer");
         const storedComputer = bot.computer;
         const computerMode = parseComputerMode(storedComputer.scope);
         const computer = await provisionComputer(deps, storedComputer.id, context, "bot");
         screenRelease = { computer, context };
         scheduleComputerSleep(deps.jobs, storedComputer.id);
+        const currentTurnFiles = deps.artifacts
+          ? await materializeCurrentTurnFiles(
+              { prisma: deps.prisma, artifacts: deps.artifacts, sandbox: deps.sandbox },
+              turnBlocks,
+              { context, computer, computerMode },
+            )
+          : [];
+        const attachedFilesPrompt = currentTurnFilesInstruction(currentTurnFiles);
         const graphical =
           computer.kind !== "desktop" && deps.sandbox.describe().capabilities.graphical;
         const nonGraphical = graphical
@@ -534,6 +662,46 @@ export function createRunExecutor(deps: ExecutorDeps) {
             );
             return finish({ ok: true, path: filePath });
           }
+          if (name === "attach_file") {
+            const filePath = String(args.path ?? "");
+            if (!deps.artifacts) {
+              return finish({ error: "artifact storage unavailable", path: filePath });
+            }
+            const storedPath = resolveBotWorkspacePath(computerMode, bot.id, filePath);
+            let bytes: Uint8Array;
+            try {
+              bytes = await deps.sandbox.readFile(computer, storedPath, context, {
+                maxBytes: ATTACHMENT_MAX_BYTES,
+              });
+            } catch {
+              return finish({ error: "file not found or unreadable", path: filePath });
+            }
+            const mimeType = inferAttachmentMimeType(filePath);
+            if (!mimeType) {
+              return finish({ error: "unsupported attachment type", path: filePath });
+            }
+            try {
+              const attached = await attachWorkspaceFileToThread(
+                { prisma: deps.prisma, artifacts: deps.artifacts },
+                {
+                  workspaceId: run.workspaceId,
+                  userId: run.userId,
+                  botId: bot.id,
+                  runId: run.id,
+                  filePath,
+                  bytes,
+                  operationId: executionId,
+                },
+              );
+              await publishMessage(deps, run, "bot", [attached.block]);
+              return finish({ ok: true, artifactId: attached.artifactId, path: filePath });
+            } catch (error) {
+              return finish({
+                error: error instanceof Error ? error.message : "could not attach file",
+                path: filePath,
+              });
+            }
+          }
           if (name === "shell") {
             const command = String(args.command ?? args.cmd ?? "");
             const cwd = resolveBotWorkspaceCwd(
@@ -612,7 +780,11 @@ export function createRunExecutor(deps: ExecutorDeps) {
             return finish({ ok: true });
           }
           if (name === "recall_memory") {
-            return searchSupermemory(String(args.query ?? ""), supermemory!.containerTag, supermemory!);
+            return searchSupermemory(
+              String(args.query ?? ""),
+              supermemory!.containerTag,
+              supermemory!,
+            );
           }
           if (name === "save_memory") {
             return finish(
@@ -748,10 +920,11 @@ export function createRunExecutor(deps: ExecutorDeps) {
               botId: bot.id,
               threadId: thread.id,
               runId,
-              prompt: task.prompt,
+              prompt: [task.prompt, attachedFilesPrompt].filter(Boolean).join("\n\n"),
               instructions: [
                 bot.instructions || `${bot.name}: ${bot.title}\n${bot.description}`,
                 memoryContext ? redactSecrets(memoryContext, runSecrets) : undefined,
+                recalledMemory ? redactSecrets(recalledMemory, runSecrets) : undefined,
                 `${computerInstruction} Use remember for durable facts. Use request_takeover when the user must provide protected input or human judgment. Use destination_write only for connected destination records.`,
                 workspaceInstruction,
                 "A bot and a subagent are different. Never use both for the same request.",
@@ -764,6 +937,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 .filter((instruction): instruction is string => Boolean(instruction))
                 .join("\n\n"),
               history,
+              currentTurnImages,
               tools,
               model: {
                 provider: credential?.provider ?? settings?.defaultModelProvider ?? "scripted",
@@ -1072,6 +1246,29 @@ export function createRunExecutor(deps: ExecutorDeps) {
               threadId: thread.id,
             });
           }
+          // Last, and never fatal: the run is already finalized, so a failure here must not reach
+          // the catch block below, where a second finalizeRun would match no rows and silently
+          // skip the completion notification.
+          if (supermemory) {
+            try {
+              const updatedThread = await deps.prisma.thread.findUniqueOrThrow({
+                where: { id: thread.id },
+                select: { nextMessageSeq: true, historyCompactedUpToSeq: true },
+              });
+              if (
+                shouldEnqueueCompaction(
+                  updatedThread.nextMessageSeq,
+                  updatedThread.historyCompactedUpToSeq,
+                  HISTORY_WINDOW_SIZE,
+                  COMPACTION_BATCH_SIZE,
+                )
+              ) {
+                await deps.jobs.enqueue(historyCompactJob(thread.id));
+              }
+            } catch (error) {
+              console.error("history.compact enqueue failed", error);
+            }
+          }
         } catch (error) {
           if (!terminalCheckpointComplete) {
             await checkpointAndRecordComputerWorkspace(
@@ -1190,7 +1387,9 @@ async function notifyRun(
       botId: run.botId,
       signal: new AbortController().signal,
     })
-    .catch(() => undefined);
+    .catch((error) => {
+      console.error("run notification", error);
+    });
 }
 
 async function renewRunLease(
@@ -1431,11 +1630,46 @@ async function withModelCredentialLock<T>(key: string, fn: () => Promise<T>): Pr
   }
 }
 
-function blocksToText(blocks: MessageBlock[]): string {
-  return blocks
-    .map((block) => {
-      if ("text" in block && block.text) return block.text;
-      return JSON.stringify(block);
-    })
-    .join("\n");
+async function loadCurrentTurnImages(
+  deps: ExecutorDeps,
+  blocks: MessageBlock[] | undefined,
+  context: {
+    operationId: string;
+    traceId: string;
+    workspaceId: string;
+    userId: string;
+    botId: string;
+    runId: string;
+    signal: AbortSignal;
+  },
+) {
+  if (!deps.artifacts || !blocks?.length) return undefined;
+  const imageBlocks = blocks.filter(
+    (block): block is Extract<MessageBlock, { kind: "image" }> => block.kind === "image",
+  );
+  if (!imageBlocks.length) return undefined;
+
+  const rows = await deps.prisma.artifact.findMany({
+    where: {
+      id: { in: imageBlocks.map((block) => block.artifactId) },
+      workspaceId: context.workspaceId,
+      botId: context.botId,
+    },
+  });
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  const images: NonNullable<import("@rakazo/adapter-kit").AgentRunRequest["currentTurnImages"]> =
+    [];
+
+  for (const block of imageBlocks) {
+    const row = byId.get(block.artifactId);
+    if (!row || !isAttachmentImageMimeType(block.mimeType)) continue;
+    const bytes = await deps.artifacts.get(row.storageKey, context);
+    images.push({
+      name: block.name,
+      mimeType: block.mimeType as "image/jpeg" | "image/png" | "image/webp" | "image/gif",
+      data: bytes,
+    });
+  }
+
+  return images.length ? images : undefined;
 }

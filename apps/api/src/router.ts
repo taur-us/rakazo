@@ -3,12 +3,14 @@ import { implement, ORPCError } from "@orpc/server";
 import {
   type AdapterContext,
   type AgentHomeStore,
+  type ArtifactStore,
   computerControlExpireJobKey,
   type JobPublisher,
   type MemoryStore,
   routineJobKey,
   routineWakeupJob,
   runContinueJob,
+  runJobKey,
   type SandboxProvider,
 } from "@rakazo/adapter-kit";
 import {
@@ -18,11 +20,14 @@ import {
   ComputerBusyError,
   type ComputerExecutionLease,
   checkpointAndRecordComputerWorkspace,
+  createVoiceProvider,
+  deleteSupermemoryContainer,
   destroyBot,
   displayBotWorkspacePath,
   type EncryptedSecretStore,
   expireComputerControl,
   hasActiveComputerControl,
+  isSupermemoryEnabled,
   listPiCatalog,
   type PiOAuthLogins,
   probeSupermemory,
@@ -36,6 +41,7 @@ import {
   screenLeaseIdForRun,
   scriptedCatalogEntry,
   serializeModelSecret,
+  supermemoryContainerTag,
   takeoverLeaseMs,
   toComputerRef,
   touchRunningComputer,
@@ -48,22 +54,46 @@ import {
   type Me,
   type ThreadSnapshot,
 } from "@rakazo/contracts";
-import { ACTIVE_RUN_STATUSES, nextCronDate, projectMessages } from "@rakazo/core";
+import {
+  ACTIVE_RUN_STATUSES,
+  AttachmentValidationError,
+  nextCronDate,
+  projectMessages,
+} from "@rakazo/core";
 import {
   createRepos,
-  createThreadMessage,
   findDefaultModelCredential,
+  findDefaultVoiceCredential,
   findWorkspaceMemoryConfig,
   IsolationError,
   newestModelCredentialOrder,
+  newestVoiceCredentialOrder,
   Prisma,
   type PrismaClient,
   parseComputerMode,
   type ThreadEvents,
 } from "@rakazo/db";
+import {
+  buildSendPrompt,
+  buildUserMessageBlocks,
+  createOwnedArtifact,
+  getOwnedArtifact,
+  resolveSendAttachments,
+} from "./artifacts.js";
 import { addScreenProxyCapability } from "./screen-proxy.js";
+import { queryWorkspaceSearch } from "./search.js";
 import { withSerializableRetry } from "./serializable-retry.js";
 import { loadAllMessages, loadMessagePage } from "./thread-message-pages.js";
+import {
+  listVoiceCatalog,
+  loadDefaultVoiceCredential,
+  loadVoiceCredential,
+  persistVoiceCredential,
+  prepareVoice,
+  toVoiceCredential,
+  toVoiceStatus,
+  voiceContext,
+} from "./voice.js";
 
 const MAX_COMPUTER_TEXT_FILE_BYTES = 2 * 1024 * 1024;
 const THREAD_MESSAGE_PAGE_SIZE = 100;
@@ -91,6 +121,7 @@ export interface RouterDeps {
   secrets: EncryptedSecretStore;
   oauthLogins: PiOAuthLogins;
   composio?: ComposioProvider;
+  artifacts: ArtifactStore;
   dataDir: string;
   env: {
     defaultProvider: string;
@@ -302,6 +333,8 @@ export function createRouter(deps: RouterDeps) {
             color: input.color,
             pinned: input.pinned,
             memoryScope: input.memoryScope,
+            voiceId: input.voiceId,
+            autoSpeak: input.autoSpeak,
           },
         });
         const bots = await repos.listBots(context.actor);
@@ -393,6 +426,7 @@ export function createRouter(deps: RouterDeps) {
             sandbox: deps.sandbox,
             home: deps.home,
             jobs: deps.jobs,
+            artifacts: deps.artifacts,
             dataDir: deps.dataDir,
           },
           bot,
@@ -415,7 +449,13 @@ export function createRouter(deps: RouterDeps) {
       messages: authed.threads.messages.handler(async ({ context, input }) => {
         const bot = await repos.getBot(context.actor, input.botId);
         if (!bot.thread) throw new IsolationError();
-        return loadMessagePage(deps.prisma, bot.thread.id, input.before, THREAD_MESSAGE_PAGE_SIZE);
+        return loadMessagePage(
+          deps.prisma,
+          bot.thread.id,
+          input.before,
+          THREAD_MESSAGE_PAGE_SIZE,
+          input.around,
+        );
       }),
       subscribe: authed.threads.subscribe.handler(async function* ({ context, input }) {
         const bot = await repos.getBot(context.actor, input.botId);
@@ -433,54 +473,39 @@ export function createRouter(deps: RouterDeps) {
           });
           if (dup) return { taskId: dup.taskId, runId: dup.id, seq: 0 };
         }
-        const message = await createThreadMessage(deps.prisma, {
-          threadId: bot.thread.id,
-          role: "user",
-          blocks: [{ kind: "text", text: input.text }],
-        });
-        await deps.events.append({
+        const { blocks: attachmentBlocks, artifacts } = await resolveSendAttachments(
+          deps,
+          context.actor,
+          bot.id,
+          input.artifactIds,
+        );
+        const blocks = buildUserMessageBlocks(input.text, attachmentBlocks);
+        const prompt = buildSendPrompt(input.text, artifacts);
+        // One transaction for message, run, and event: serialized against clearThread by the
+        // thread-row lock, so a concurrent clear either sees the committed run and cancels it
+        // or strictly precedes the whole send.
+        const sent = await deps.events.sendUserMessage({
           workspaceId: context.actor.workspaceId,
           threadId: bot.thread.id,
           botId: bot.id,
-          type: "thread.message.created",
-          payload: {
-            messageId: message.id,
-            role: "user",
-            blocks: [{ kind: "text", text: input.text }],
-          },
+          userId: context.actor.userId,
+          blocks,
+          prompt,
+          trigger: "user",
+          clientNonce: input.clientNonce,
+          linkMessageToRun: true,
         });
-        const task = await deps.prisma.task.create({
-          data: {
-            workspaceId: context.actor.workspaceId,
-            botId: bot.id,
-            threadId: bot.thread.id,
-            userId: context.actor.userId,
-            prompt: input.text,
-            status: "queued",
-          },
-        });
-        const run = await deps.prisma.run.create({
-          data: {
-            workspaceId: context.actor.workspaceId,
-            botId: bot.id,
-            threadId: bot.thread.id,
-            taskId: task.id,
-            userId: context.actor.userId,
-            status: "queued",
-            trigger: "user",
-            clientNonce: input.clientNonce,
-          },
-        });
+        const runId = sent.runId!;
         await deps.prisma.run.updateMany({
           where: {
             botId: bot.id,
             status: "queued",
-            id: { not: run.id },
+            id: { not: runId },
           },
           data: { status: "cancelled", completedAt: new Date() },
         });
-        await deps.jobs.enqueue(runContinueJob(run.id));
-        return { taskId: task.id, runId: run.id, seq: message.seq };
+        await deps.jobs.enqueue(runContinueJob(runId));
+        return { taskId: sent.taskId!, runId, seq: sent.seq };
       }),
       stop: authed.threads.stop.handler(async ({ context, input }) => {
         const bot = await repos.getBot(context.actor, input.botId);
@@ -523,51 +548,42 @@ export function createRouter(deps: RouterDeps) {
         });
         return { ok: true as const };
       }),
-      followUp: authed.threads.followUp.handler(async ({ context, input }) => {
+      clear: authed.threads.clear.handler(async ({ context, input }) => {
         const bot = await repos.getBot(context.actor, input.botId);
         if (!bot.thread) throw new IsolationError();
-        const message = await createThreadMessage(deps.prisma, {
-          threadId: bot.thread.id,
-          role: "user",
-          blocks: [{ kind: "text", text: input.text }],
-        });
-        await deps.events.append({
+        const { cancelledRunIds } = await deps.events.clearThread({
           workspaceId: context.actor.workspaceId,
           threadId: bot.thread.id,
           botId: bot.id,
-          type: "thread.message.created",
-          payload: {
-            messageId: message.id,
-            role: "user",
-            blocks: [{ kind: "text", text: input.text }],
-          },
         });
-        const active = await deps.prisma.run.findFirst({
-          where: { botId: bot.id, status: { in: ["running", "queued", "leased"] } },
+        await Promise.all(
+          cancelledRunIds.map((runId) => deps.jobs.cancel(runJobKey(runId)).catch(() => undefined)),
+        );
+        if (isSupermemoryEnabled(process.env.SUPERMEMORY_API_KEY)) {
+          // Best effort: the conversation rows are already deleted, so failing the clear here
+          // would help nothing — a failed purge only leaves stale summaries recallable.
+          const purged = await deleteSupermemoryContainer(supermemoryContainerTag(bot.id));
+          if (!purged.ok) {
+            console.error("supermemory purge after thread clear failed", purged.error);
+          }
+        }
+        return { ok: true as const };
+      }),
+      followUp: authed.threads.followUp.handler(async ({ context, input }) => {
+        const bot = await repos.getBot(context.actor, input.botId);
+        if (!bot.thread) throw new IsolationError();
+        // One atomic send — see threads/send for why this must serialize with clearThread.
+        const sent = await deps.events.sendUserMessage({
+          workspaceId: context.actor.workspaceId,
+          threadId: bot.thread.id,
+          botId: bot.id,
+          userId: context.actor.userId,
+          blocks: [{ kind: "text", text: input.text }],
+          prompt: input.text,
+          trigger: "follow_up",
+          onlyIfIdle: true,
         });
-        if (active) return { ok: true as const };
-        const task = await deps.prisma.task.create({
-          data: {
-            workspaceId: context.actor.workspaceId,
-            botId: bot.id,
-            threadId: bot.thread.id,
-            userId: context.actor.userId,
-            prompt: input.text,
-            status: "queued",
-          },
-        });
-        const run = await deps.prisma.run.create({
-          data: {
-            workspaceId: context.actor.workspaceId,
-            botId: bot.id,
-            threadId: bot.thread.id,
-            taskId: task.id,
-            userId: context.actor.userId,
-            status: "queued",
-            trigger: "follow_up",
-          },
-        });
-        await deps.jobs.enqueue(runContinueJob(run.id));
+        if (sent.runId) await deps.jobs.enqueue(runContinueJob(sent.runId));
         return { ok: true as const };
       }),
       answer: authed.threads.answer.handler(async ({ context, input }) => {
@@ -1012,7 +1028,13 @@ export function createRouter(deps: RouterDeps) {
           !(hasActiveComputerControl(bot.computer) && bot.computer.controlBotId === bot.id),
         );
         return {
-          url: addScreenProxyCapability(viewUrl, deps.env.screenProxySecret, deps.env.webOrigin),
+          url: addScreenProxyCapability(
+            viewUrl,
+            deps.env.screenProxySecret,
+            deps.env.webOrigin,
+            undefined,
+            { proxyExternal: bot.computer.kind === "box" },
+          ),
         };
       }),
       heartbeat: authed.computer.heartbeat.handler(async ({ context, input }) => {
@@ -1453,6 +1475,26 @@ export function createRouter(deps: RouterDeps) {
           createdAt: row.createdAt.toISOString(),
         }));
       }),
+      create: authed.artifacts.create.handler(async ({ context, input }) => {
+        await repos.getBot(context.actor, input.botId);
+        try {
+          return await createOwnedArtifact(deps, context.actor, input);
+        } catch (error) {
+          if (error instanceof AttachmentValidationError) {
+            throw new ORPCError("BAD_REQUEST", { message: error.message });
+          }
+          throw error;
+        }
+      }),
+      get: authed.artifacts.get.handler(async ({ context, input }) => {
+        await repos.getBot(context.actor, input.botId);
+        try {
+          return await getOwnedArtifact(deps, context.actor, input);
+        } catch (error) {
+          if (error instanceof IsolationError) throw error;
+          throw error;
+        }
+      }),
     },
     usage: {
       list: authed.usage.list.handler(async ({ context }) => {
@@ -1542,6 +1584,71 @@ export function createRouter(deps: RouterDeps) {
         await savePushToken(deps.dataDir, context.actor.userId, input.token);
         return { ok: true as const };
       }),
+    },
+    search: {
+      query: authed.search.query.handler(async ({ context, input }) => ({
+        hits: await queryWorkspaceSearch(deps.prisma, context.actor, input.q),
+      })),
+    },
+    voice: {
+      catalog: authed.voice.catalog.handler(async () => listVoiceCatalog()),
+      status: authed.voice.status.handler(async ({ context }) => {
+        const cred = await findDefaultVoiceCredential(deps.prisma, context.actor);
+        return toVoiceStatus(cred);
+      }),
+      credentials: authed.voice.credentials.handler(async ({ context }) => {
+        const rows = await deps.prisma.userVoiceCredential.findMany({
+          where: { userId: context.actor.userId, workspaceId: context.actor.workspaceId },
+          orderBy: newestVoiceCredentialOrder,
+        });
+        return rows.map(toVoiceCredential);
+      }),
+      connect: authed.voice.connect.handler(async ({ context, input }) =>
+        persistVoiceCredential(deps, context.actor, {
+          provider: input.provider,
+          plaintext: input.apiKey,
+          label: input.label,
+          voiceId: input.voiceId,
+          signal: context.signal,
+        }),
+      ),
+      setVoice: authed.voice.setVoice.handler(async ({ context, input }) => {
+        const cred = input.provider
+          ? await deps.prisma.userVoiceCredential.findFirst({
+              where: {
+                userId: context.actor.userId,
+                workspaceId: context.actor.workspaceId,
+                provider: input.provider,
+              },
+              orderBy: newestVoiceCredentialOrder,
+            })
+          : await findDefaultVoiceCredential(deps.prisma, context.actor);
+        if (!cred) {
+          throw new ORPCError("BAD_REQUEST", { message: "Connect a voice provider first." });
+        }
+        await deps.prisma.userVoiceCredential.update({
+          where: { id: cred.id },
+          data: { voiceId: input.voiceId },
+        });
+        return toVoiceStatus({ ...cred, voiceId: input.voiceId });
+      }),
+      voices: authed.voice.voices.handler(async ({ context, input }) => {
+        const loaded = await loadDefaultVoiceCredential(deps, context.actor);
+        if (!loaded) return [];
+        const providerId = input.provider ?? loaded.cred.provider;
+        const row =
+          providerId === loaded.cred.provider
+            ? loaded
+            : await loadVoiceCredential(deps, context.actor, providerId);
+        if (!row) return [];
+        return createVoiceProvider(row.cred.provider).listVoices(
+          row.apiKey,
+          voiceContext(context.actor, context.signal),
+        );
+      }),
+      prepare: authed.voice.prepare.handler(async ({ context, input }) =>
+        prepareVoice(deps, context.actor, input),
+      ),
     },
   });
 }

@@ -22,6 +22,8 @@ export function mapBot(
     updatedAt: Date;
     thread: { id: string; unread: boolean } | null;
     computer: { scope: string } | null;
+    voiceId?: string | null;
+    autoSpeak?: boolean;
   },
   preview = "",
   status = "idle",
@@ -49,6 +51,8 @@ export function mapBot(
     computerMode: bot.computer ? parseComputerMode(bot.computer.scope) : "team",
     createdAt: bot.createdAt.toISOString(),
     updatedAt: bot.updatedAt.toISOString(),
+    voiceId: bot.voiceId ?? null,
+    autoSpeak: bot.autoSpeak ?? false,
   };
 }
 

@@ -28,6 +28,8 @@ export const BotSchema = z.object({
   computerMode: ComputerModeSchema,
   updatedAt: z.string(),
   createdAt: z.string(),
+  voiceId: z.string().nullable(),
+  autoSpeak: z.boolean(),
 });
 export type Bot = z.infer<typeof BotSchema>;
 
@@ -52,6 +54,8 @@ export const UpdateBotInput = z.object({
   color: z.string().optional(),
   pinned: z.boolean().optional(),
   memoryScope: MemoryScopeSchema.nullable().optional(),
+  voiceId: z.string().max(120).nullable().optional(),
+  autoSpeak: z.boolean().optional(),
 });
 
 export const RoutineSchema = z.object({
@@ -130,6 +134,11 @@ export const ArtifactSchema = z.object({
   size: z.number().int(),
   createdAt: z.string(),
 });
+
+export const ArtifactWithContentSchema = ArtifactSchema.extend({
+  contentBase64: z.string(),
+});
+export type ArtifactWithContent = z.infer<typeof ArtifactWithContentSchema>;
 
 export const UsageRecordSchema = z.object({
   id: Id,
@@ -219,6 +228,41 @@ export const ModelCatalogEntrySchema = z.object({
   keyless: z.boolean().optional(),
 });
 export type ModelCatalogEntry = z.infer<typeof ModelCatalogEntrySchema>;
+
+export const VoiceCatalogEntrySchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string(),
+  transcribe: z.boolean(),
+});
+export type VoiceCatalogEntry = z.infer<typeof VoiceCatalogEntrySchema>;
+
+export const VoiceInfoSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  description: z.string().optional(),
+});
+export type VoiceInfo = z.infer<typeof VoiceInfoSchema>;
+
+export const VoiceCredentialSchema = z.object({
+  id: Id,
+  provider: z.string(),
+  label: z.string(),
+  hasKey: z.boolean(),
+  isDefault: z.boolean(),
+  voiceId: z.string(),
+  transcribe: z.boolean(),
+});
+export type VoiceCredential = z.infer<typeof VoiceCredentialSchema>;
+
+export const VoiceStatusSchema = z.object({
+  configured: z.boolean(),
+  ready: z.boolean(),
+  transcribe: z.boolean(),
+  provider: z.string().nullable(),
+  voiceId: z.string(),
+});
+export type VoiceStatus = z.infer<typeof VoiceStatusSchema>;
 
 export const DeploymentSettingsSchema = z.object({
   ownerUserId: Id.nullable(),

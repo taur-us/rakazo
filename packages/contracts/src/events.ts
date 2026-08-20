@@ -3,6 +3,7 @@ import { Id } from "./ids.js";
 
 export const ProductEventType = z.enum([
   "thread.message.created",
+  "thread.cleared",
   "thread.message.updated",
   "thread.progress",
   "thread.artifact",
@@ -90,6 +91,19 @@ export const MessageBlock = z.discriminatedUnion("kind", [
     name: z.string(),
     title: z.string().optional(),
     status: z.enum(["created", "archived", "deleted"]),
+  }),
+  z.object({
+    kind: z.literal("image"),
+    artifactId: Id,
+    mimeType: z.string(),
+    name: z.string(),
+  }),
+  z.object({
+    kind: z.literal("file"),
+    artifactId: Id,
+    mimeType: z.string(),
+    name: z.string(),
+    size: z.number().int().nonnegative(),
   }),
 ]);
 export type MessageBlock = z.infer<typeof MessageBlock>;

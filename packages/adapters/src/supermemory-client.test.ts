@@ -1,13 +1,29 @@
 import { describe, expect, it, vi } from "vitest";
-import { probeSupermemory, saveSupermemoryMemory, searchSupermemory } from "./supermemory-client.js";
+import {
+  deleteSupermemoryContainer,
+  MAX_MEMORY_CONTENT_CHARS,
+  MAX_RECALLED_MEMORIES,
+  probeSupermemory,
+  saveSupermemoryMemory,
+  searchSupermemory,
+  supermemoryContainerTag,
+} from "./supermemory-client.js";
 
 const config = { baseUrl: "http://localhost:6767", apiKey: "sm_test_key" };
+
+describe("supermemoryContainerTag", () => {
+  it("scopes the tag to the bot id", () => {
+    expect(supermemoryContainerTag("bot-123")).toBe("rakazo:bot-123");
+  });
+});
 
 describe("searchSupermemory", () => {
   it("posts the query and container tag, returning search results on success", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
-        JSON.stringify({ results: [{ memory: "User prefers British English", similarity: 0.9 }] }),
+        JSON.stringify({
+          results: [{ memory: "User prefers British English", similarity: 0.9 }],
+        }),
         { status: 200 },
       ),
     );
@@ -22,9 +38,11 @@ describe("searchSupermemory", () => {
     const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe("http://localhost:6767/v4/search");
     expect(init.headers.Authorization).toBe("Bearer sm_test_key");
-    expect(JSON.parse(init.body)).toEqual({
+    expect(JSON.parse(init.body)).toStrictEqual({
       q: "spelling preference",
-      containerTags: ["rakazo:bot-123"],
+      containerTag: "rakazo:bot-123",
+      searchMode: "memories",
+      limit: MAX_RECALLED_MEMORIES,
     });
     vi.unstubAllGlobals();
   });
@@ -42,6 +60,44 @@ describe("searchSupermemory", () => {
     expect(result).toEqual({ ok: false, error: expect.stringContaining("unreachable") });
     vi.unstubAllGlobals();
   });
+
+  it("treats document chunks as memory text when the search result has no memory field", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ results: [{ chunk: "Older decision: use Postgres." }] }), {
+          status: 200,
+        }),
+      ),
+    );
+
+    const result = await searchSupermemory("database", "rakazo:bot-123", config);
+
+    expect(result).toEqual({
+      ok: true,
+      results: [{ memory: "Older decision: use Postgres.", similarity: 0 }],
+    });
+    vi.unstubAllGlobals();
+  });
+
+  it("drops malformed search hits instead of injecting empty memories", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ results: [{}, { memory: "  " }, "nope", { memory: "kept" }] }),
+          {
+            status: 200,
+          },
+        ),
+      ),
+    );
+
+    const result = await searchSupermemory("anything", "rakazo:bot-123", config);
+
+    expect(result).toEqual({ ok: true, results: [{ memory: "kept", similarity: 0 }] });
+    vi.unstubAllGlobals();
+  });
 });
 
 describe("saveSupermemoryMemory", () => {
@@ -49,7 +105,11 @@ describe("saveSupermemoryMemory", () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response("", { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
 
-    const result = await saveSupermemoryMemory("User prefers British English", "rakazo:bot-123", config);
+    const result = await saveSupermemoryMemory(
+      "User prefers British English",
+      "rakazo:bot-123",
+      config,
+    );
 
     expect(result).toEqual({ ok: true });
     const [url, init] = fetchMock.mock.calls[0]!;
@@ -61,10 +121,47 @@ describe("saveSupermemoryMemory", () => {
     vi.unstubAllGlobals();
   });
 
+  it("caps oversized content at the API limit", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await saveSupermemoryMemory(
+      `prefix ${"x".repeat(MAX_MEMORY_CONTENT_CHARS)}`,
+      "rakazo:bot-123",
+      config,
+    );
+
+    const body = JSON.parse(fetchMock.mock.calls[0]![1].body);
+    expect(body.memories[0].content).toHaveLength(MAX_MEMORY_CONTENT_CHARS);
+    vi.unstubAllGlobals();
+  });
+
   it("reports a non-OK response instead of throwing", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 401 })));
     const result = await saveSupermemoryMemory("fact", "rakazo:bot-123", config);
     expect(result).toEqual({ ok: false, error: expect.stringContaining("401") });
+    vi.unstubAllGlobals();
+  });
+});
+
+describe("deleteSupermemoryContainer", () => {
+  it("deletes the container tag on success", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await deleteSupermemoryContainer("rakazo:bot-123", config);
+
+    expect(result).toEqual({ ok: true });
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("http://localhost:6767/v3/container-tags/rakazo%3Abot-123");
+    expect(init.method).toBe("DELETE");
+    vi.unstubAllGlobals();
+  });
+
+  it("reports a non-OK response instead of throwing", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 404 })));
+    const result = await deleteSupermemoryContainer("rakazo:bot-123", config);
+    expect(result).toEqual({ ok: false, error: expect.stringContaining("404") });
     vi.unstubAllGlobals();
   });
 });
