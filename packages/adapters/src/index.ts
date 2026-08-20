@@ -40,5 +40,6 @@ export * from "./scripted-runtime.js";
 export * from "./scripted-voice.js";
 export * from "./secrets.js";
 export * from "./supermemory-client.js";
+export * from "./teaching-session.js";
 export * from "./voice-factory.js";
 export * from "./wakeup.js";

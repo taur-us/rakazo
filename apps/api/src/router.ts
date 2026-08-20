@@ -15,6 +15,7 @@ import {
 } from "@rakazo/adapter-kit";
 import {
   acquireComputerExecutionLease,
+  applyTeachingDesktopInput,
   archiveBot,
   type ComposioProvider,
   ComputerBusyError,
@@ -56,6 +57,7 @@ import {
 import {
   ACTIVE_RUN_STATUSES,
   AttachmentValidationError,
+  computerScreenSize,
   nextCronDate,
   projectMessages,
 } from "@rakazo/core";
@@ -83,6 +85,7 @@ import {
 import { addScreenProxyCapability } from "./screen-proxy.js";
 import { queryWorkspaceSearch } from "./search.js";
 import { withSerializableRetry } from "./serializable-retry.js";
+import { assertTeachingSendAllowed, createTaughtSkillsService } from "./taught-skills.js";
 import { loadAllMessages, loadMessagePage } from "./thread-message-pages.js";
 import {
   listVoiceCatalog,
@@ -136,6 +139,14 @@ export interface RouterDeps {
 export function createRouter(deps: RouterDeps) {
   const os = implement(appContract).$context<{ actor: Actor | null; signal?: AbortSignal }>();
   const repos = createRepos(deps.prisma);
+  const taughtSkills = createTaughtSkillsService({
+    prisma: deps.prisma,
+    events: deps.events,
+    jobs: deps.jobs,
+    sandbox: deps.sandbox,
+    home: deps.home,
+    dataDir: deps.dataDir,
+  });
 
   const authed = os.use(async ({ context, next }) => {
     if (!context.actor) throw new ORPCError("UNAUTHORIZED");
@@ -467,6 +478,7 @@ export function createRouter(deps: RouterDeps) {
       send: authed.threads.send.handler(async ({ context, input }) => {
         const bot = await repos.getBot(context.actor, input.botId);
         if (!bot.thread) throw new IsolationError();
+        await assertTeachingSendAllowed(deps.prisma, context.actor.workspaceId, bot.id);
         if (input.clientNonce) {
           const dup = await deps.prisma.run.findFirst({
             where: { workspaceId: context.actor.workspaceId, clientNonce: input.clientNonce },
@@ -589,6 +601,7 @@ export function createRouter(deps: RouterDeps) {
       followUp: authed.threads.followUp.handler(async ({ context, input }) => {
         const bot = await repos.getBot(context.actor, input.botId);
         if (!bot.thread) throw new IsolationError();
+        await assertTeachingSendAllowed(deps.prisma, context.actor.workspaceId, bot.id);
         // One atomic send — see threads/send for why this must serialize with clearThread.
         const sent = await deps.events.sendUserMessage({
           workspaceId: context.actor.workspaceId,
@@ -933,20 +946,32 @@ export function createRouter(deps: RouterDeps) {
             ? { kind: "key" as const, key: String(input.payload.key ?? "") }
             : input.kind === "clipboard"
               ? { kind: "clipboard" as const, text: String(input.payload.text ?? "") }
-              : {
-                  kind: "pointer" as const,
-                  x: Number(input.payload.x ?? 0),
-                  y: Number(input.payload.y ?? 0),
-                  button: (input.payload.button as "left" | "right" | undefined) ?? "left",
-                  type:
-                    (input.payload.type as "move" | "down" | "up" | "click" | undefined) ?? "click",
-                };
-        await deps.sandbox.sendInput(
-          toComputerRef(computer),
-          mapped,
-          { leaseId: computer.controlLeaseId ?? "lease", holder: "user", fence: 0 },
-          computerContext(context.actor, bot.id, "input"),
-        );
+              : input.kind === "scroll"
+                ? {
+                    kind: "scroll" as const,
+                    direction:
+                      input.payload.direction === "up" ? ("up" as const) : ("down" as const),
+                    amount: Number(input.payload.amount ?? 3),
+                  }
+                : {
+                    kind: "pointer" as const,
+                    x: Number(input.payload.x ?? 0),
+                    y: Number(input.payload.y ?? 0),
+                    button: (input.payload.button as "left" | "right" | undefined) ?? "left",
+                    type:
+                      (input.payload.type as "move" | "down" | "up" | "click" | undefined) ??
+                      "click",
+                  };
+        const outcome = await taughtSkills.recordInput(context.actor, bot.id, mapped);
+        if (outcome === "stale") return { ok: true as const };
+        if (outcome !== "recorded") {
+          await applyTeachingDesktopInput(
+            deps.sandbox,
+            computer,
+            mapped,
+            computerContext(context.actor, bot.id, "input"),
+          );
+        }
         await deps.prisma.computer.updateMany({
           where: { id: computer.id, state: "running" },
           data: { updatedAt: new Date() },
@@ -1285,6 +1310,43 @@ export function createRouter(deps: RouterDeps) {
         await deps.jobs.enqueue(runContinueJob(run.id));
         return { runId: run.id };
       }),
+    },
+    skills: {
+      list: authed.skills.list.handler(async ({ context, input }) => {
+        await repos.getBot(context.actor, input.botId);
+        return taughtSkills.list(context.actor, input.botId);
+      }),
+      get: authed.skills.get.handler(async ({ context, input }) =>
+        taughtSkills.get(context.actor, input.skillId),
+      ),
+      start: authed.skills.start.handler(async ({ context, input }) => {
+        await repos.getBot(context.actor, input.botId);
+        return taughtSkills.start(context.actor, input.botId, input.goal);
+      }),
+      appendEvent: authed.skills.appendEvent.handler(async ({ context, input }) =>
+        taughtSkills.appendEvent(context.actor, input.skillId, input.event),
+      ),
+      snapshot: authed.skills.snapshot.handler(async ({ context, input }) =>
+        taughtSkills.snapshot(context.actor, input.skillId),
+      ),
+      stop: authed.skills.stop.handler(async ({ context, input }) =>
+        taughtSkills.stop(context.actor, input.skillId),
+      ),
+      updateDraft: authed.skills.updateDraft.handler(async ({ context, input }) =>
+        taughtSkills.updateDraft(context.actor, input.skillId, {
+          name: input.name,
+          playbook: input.playbook,
+        }),
+      ),
+      save: authed.skills.save.handler(async ({ context, input }) =>
+        taughtSkills.save(context.actor, input.skillId, input.name),
+      ),
+      testRun: authed.skills.testRun.handler(async ({ context, input }) =>
+        taughtSkills.testRun(context.actor, input.skillId, input.prompt),
+      ),
+      remove: authed.skills.remove.handler(async ({ context, input }) =>
+        taughtSkills.remove(context.actor, input.skillId),
+      ),
     },
     capabilities: {
       list: authed.capabilities.list.handler(async ({ context }) => {
@@ -1630,30 +1692,53 @@ export function createRouter(deps: RouterDeps) {
         persistVoiceCredential(deps, context.actor, {
           provider: input.provider,
           plaintext: input.apiKey,
-          label: input.label,
           voiceId: input.voiceId,
           signal: context.signal,
         }),
       ),
       setVoice: authed.voice.setVoice.handler(async ({ context, input }) => {
-        const cred = input.provider
-          ? await deps.prisma.userVoiceCredential.findFirst({
-              where: {
-                userId: context.actor.userId,
-                workspaceId: context.actor.workspaceId,
-                provider: input.provider,
-              },
-              orderBy: newestVoiceCredentialOrder,
-            })
-          : await findDefaultVoiceCredential(deps.prisma, context.actor);
-        if (!cred) {
-          throw new ORPCError("BAD_REQUEST", { message: "Connect a voice provider first." });
-        }
-        await deps.prisma.userVoiceCredential.update({
-          where: { id: cred.id },
-          data: { voiceId: input.voiceId },
-        });
-        return toVoiceStatus({ ...cred, voiceId: input.voiceId });
+        const cred = await withSerializableRetry(() =>
+          deps.prisma.$transaction(
+            async (tx) => {
+              const found = input.provider
+                ? await tx.userVoiceCredential.findUnique({
+                    where: {
+                      userId_workspaceId_provider: {
+                        userId: context.actor.userId,
+                        workspaceId: context.actor.workspaceId,
+                        provider: input.provider,
+                      },
+                    },
+                  })
+                : await tx.userVoiceCredential.findFirst({
+                    where: {
+                      userId: context.actor.userId,
+                      workspaceId: context.actor.workspaceId,
+                      isDefault: true,
+                    },
+                    orderBy: newestVoiceCredentialOrder,
+                  });
+              if (!found) {
+                throw new ORPCError("BAD_REQUEST", { message: "Connect a voice provider first." });
+              }
+              // Picking a voice also makes its provider the one speak/transcribe use.
+              await tx.userVoiceCredential.updateMany({
+                where: {
+                  userId: context.actor.userId,
+                  workspaceId: context.actor.workspaceId,
+                  id: { not: found.id },
+                },
+                data: { isDefault: false },
+              });
+              return tx.userVoiceCredential.update({
+                where: { id: found.id },
+                data: { voiceId: input.voiceId, isDefault: true },
+              });
+            },
+            { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+          ),
+        );
+        return toVoiceStatus(cred);
       }),
       voices: authed.voice.voices.handler(async ({ context, input }) => {
         const loaded = await loadDefaultVoiceCredential(deps, context.actor);
@@ -1827,6 +1912,7 @@ function toComputerStatus(
           computer?.state === "error"
         ? computer.state
         : "stopped";
+  const screen = computerScreenSize(computer?.kind);
   return {
     botId,
     mode: computer?.scope === "dedicated" ? "dedicated" : "team",
@@ -1835,6 +1921,8 @@ function toComputerStatus(
     controlHolder: (computer?.controlHolder ?? "none") as ComputerStatus["controlHolder"],
     controlBotId: computer?.controlBotId ?? null,
     screenAvailable: state === "running" || state === "booting",
+    screenWidth: screen.width,
+    screenHeight: screen.height,
     homeRevision: computer?.homeRevision ?? null,
     busyBotName: null,
   };

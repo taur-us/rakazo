@@ -92,6 +92,7 @@ model Organization {
   tasks       Task[]
   runs        Run[]
   routines    Routine[]
+  taughtSkills TaughtSkill[]
   connections Connection[]
   capabilities CapabilityInstall[]
   memoryDocuments MemoryDocument[]
@@ -177,14 +178,13 @@ model UserVoiceCredential {
   user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   workspaceId String
   provider    String
-  label       String
   secretId    String
   isDefault   Boolean  @default(false)
   voiceId     String   @default("")
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  @@index([userId, workspaceId])
+  @@unique([userId, workspaceId, provider])
   @@map("user_voice_credentials")
 }
 
@@ -215,6 +215,7 @@ model Bot {
   voiceId        String?
   autoSpeak      Boolean  @default(false)
   routines       Routine[]
+  taughtSkills   TaughtSkill[]
   memoryDocuments MemoryDocument[]
   agentHome      AgentHome?
   browserProfile BrowserProfile?
@@ -408,6 +409,31 @@ model Routine {
   @@index([active, nextRunAt])
   @@index([workspaceId, botId])
   @@map("routines")
+}
+
+model TaughtSkill {
+  id          String    @id @default(cuid())
+  workspaceId String
+  workspace   Organization @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  botId       String
+  bot         Bot       @relation(fields: [botId], references: [id], onDelete: Cascade)
+  userId      String
+  name        String    @default("")
+  goal        String
+  status      String
+  playbook    Json      @default("{}")
+  recording   Json      @default("{\"events\":[],\"snapshots\":[]}")
+  startedAt   DateTime?
+  expiresAt   DateTime?
+  stoppedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([workspaceId, botId])
+  @@index([workspaceId, botId, status])
+  // Partial unique index taught_skills_botId_recording_key is created in SQL:
+  // one recording session per bot.
+  @@map("taught_skills")
 }
 
 model Connection {

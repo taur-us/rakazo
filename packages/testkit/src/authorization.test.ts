@@ -105,6 +105,22 @@ describeWithDatabase("API authorization and resource isolation", () => {
       ["routines/update", { routineId: "missing-routine", name: "Nope" }],
       ["routines/remove", { routineId: "missing-routine" }],
       ["routines/testRun", { routineId: "missing-routine" }],
+      ["skills/list", { botId: "missing-bot" }],
+      ["skills/get", { skillId: "missing-skill" }],
+      ["skills/start", { botId: "missing-bot", goal: "Demonstrate export" }],
+      [
+        "skills/appendEvent",
+        {
+          skillId: "missing-skill",
+          event: { at: new Date().toISOString(), kind: "key", key: "a" },
+        },
+      ],
+      ["skills/snapshot", { skillId: "missing-skill" }],
+      ["skills/stop", { skillId: "missing-skill" }],
+      ["skills/updateDraft", { skillId: "missing-skill", playbook: skillPlaybookInput() }],
+      ["skills/save", { skillId: "missing-skill" }],
+      ["skills/testRun", { skillId: "missing-skill" }],
+      ["skills/remove", { skillId: "missing-skill" }],
       ["capabilities/list"],
       ["capabilities/install", capabilityInput("Unauthenticated")],
       ["capabilities/remove", { id: "missing-capability" }],
@@ -159,6 +175,18 @@ describeWithDatabase("API authorization and resource isolation", () => {
       "routines/create",
       routineInput(ownerBot.id),
     );
+    const ownerSkill = await handles.prisma.taughtSkill.create({
+      data: {
+        workspaceId: ownerActor.workspaceId,
+        botId: ownerBot.id,
+        userId: ownerActor.userId,
+        name: "Owner Skill",
+        goal: "Owner-only skill",
+        status: "saved",
+        playbook: skillPlaybookInput(),
+        recording: { events: [], snapshots: [] },
+      },
+    });
     const ownerCapability = await rpc<{ id: string }>(
       app,
       owner,
@@ -255,6 +283,8 @@ describeWithDatabase("API authorization and resource isolation", () => {
       ["computer/heartbeat", { botId: ownerBot.id }],
       ["routines/list", { botId: ownerBot.id }],
       ["routines/create", routineInput(ownerBot.id)],
+      ["skills/list", { botId: ownerBot.id }],
+      ["skills/start", { botId: ownerBot.id, goal: "Intruder demo" }],
       ["artifacts/list", { botId: ownerBot.id }],
       [
         "artifacts/create",
@@ -285,6 +315,17 @@ describeWithDatabase("API authorization and resource isolation", () => {
       ["routines/update", { routineId: ownerRoutine.id, name: "Stolen Routine" }],
       ["routines/remove", { routineId: ownerRoutine.id }],
       ["routines/testRun", { routineId: ownerRoutine.id }],
+      ["skills/get", { skillId: ownerSkill.id }],
+      [
+        "skills/appendEvent",
+        { skillId: ownerSkill.id, event: { at: new Date().toISOString(), kind: "key", key: "x" } },
+      ],
+      ["skills/snapshot", { skillId: ownerSkill.id }],
+      ["skills/stop", { skillId: ownerSkill.id }],
+      ["skills/updateDraft", { skillId: ownerSkill.id, playbook: skillPlaybookInput() }],
+      ["skills/save", { skillId: ownerSkill.id }],
+      ["skills/testRun", { skillId: ownerSkill.id }],
+      ["skills/remove", { skillId: ownerSkill.id }],
       ["memory/update", { documentId: ownerMemory.id, content: "stolen" }],
       ["connections/complete", { connectionId: ownerConnection.connectionId }],
     ] satisfies Array<[string, unknown]>;
@@ -572,6 +613,18 @@ function routineInput(botId: string) {
     timezone: "UTC",
     notify: false,
     active: false,
+  };
+}
+
+function skillPlaybookInput() {
+  return {
+    whenToUse: "When needed",
+    inputs: ["example"],
+    steps: ["Do the thing"],
+    howToCheck: "Verify result",
+    whatToReturn: "Summary",
+    approvalBoundaries: "Ask first",
+    failureHandling: "Stop and ask",
   };
 }
 

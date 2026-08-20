@@ -7,6 +7,7 @@ import type {
   ProductEvent,
   Routine,
   SearchHit,
+  TaughtSkill,
   ThreadMessage,
   ThreadSnapshot,
   VoiceInfo,
@@ -30,6 +31,23 @@ import {
 } from "@rakazo/core";
 import { BotAvatar, Button } from "@rakazo/ui-web";
 import {
+  ArrowUp,
+  ChevronLeft,
+  Cpu,
+  Gauge,
+  LogOut,
+  Mic,
+  Monitor,
+  Paperclip,
+  Phone,
+  Plus,
+  Puzzle,
+  Settings,
+  Square,
+  Volume2,
+  X,
+} from "lucide-react";
+import {
   type Dispatch,
   lazy,
   memo,
@@ -44,6 +62,10 @@ import {
   useState,
 } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { SkillDraftCard } from "../components/teach/SkillDraftCard";
+import { TeachCaptureOverlay } from "../components/teach/TeachCaptureOverlay";
+import { TeachComputerSection } from "../components/teach/TeachComputerSection";
+import { TeachRecordingChrome, TeachStopButton } from "../components/teach/TeachRecordingChrome";
 import { decodeArtifactBase64, openArtifact } from "../lib/artifact-open";
 import { authClient } from "../lib/auth";
 import { takeInitialBootstrap } from "../lib/bootstrap";
@@ -118,6 +140,9 @@ export function ShellPage() {
   const [panel, setPanel] = useState<Panel>(null);
   const [routines, setRoutines] = useState<Routine[]>([]);
   const [routinesBotId, setRoutinesBotId] = useState<string | null>(null);
+  const [taughtSkills, setTaughtSkills] = useState<TaughtSkill[]>([]);
+  const [taughtSkillsBotId, setTaughtSkillsBotId] = useState<string | null>(null);
+  const [teachBusy, setTeachBusy] = useState(false);
   const [computer, setComputer] = useState<ComputerStatus | null>(null);
   const [pluginsOpen, setPluginsOpen] = useState(false);
   const [modelsOpen, setModelsOpen] = useState(false);
@@ -182,6 +207,8 @@ export function ShellPage() {
     [active?.id, pendingAttachments],
   );
   const activeRoutines = routinesBotId === active?.id ? routines : [];
+  const activeTaughtSkills = taughtSkillsBotId === active?.id ? taughtSkills : [];
+  const recordingSkill = activeTaughtSkills.find((skill) => skill.status === "recording") ?? null;
   const routeBotId = useRef<string | undefined>(botId);
   routeBotId.current = botId;
   const activeBotId = useRef<string | undefined>(active?.id);
@@ -260,9 +287,10 @@ export function ShellPage() {
     const pin = pinnedAroundRef.current;
     const keepPin = pin?.botId === id;
     const epoch = historyEpoch.current;
-    const [snap, routines] = await Promise.all([
+    const [snap, routines, skills] = await Promise.all([
       rpc.threads.get({ botId: id }),
       rpc.routines.list({ botId: id }),
+      rpc.skills.list({ botId: id }),
       refreshComputerScreen(id),
     ]);
     markOnce("rk:renderer:thread-response");
@@ -283,6 +311,8 @@ export function ShellPage() {
     setComputer(snap.computer);
     setRoutines(routines);
     setRoutinesBotId(id);
+    setTaughtSkills(skills);
+    setTaughtSkillsBotId(id);
     if (!keepPin && stickToEnd) {
       window.requestAnimationFrame(() => {
         const element = messageScroll.current;
@@ -493,7 +523,7 @@ export function ShellPage() {
               }
               if (event.payload.role === "bot") markBotReadIfVisible(active.id);
             }
-            if (event.type === "run.completed") {
+            if (event.type === "run.completed" || event.type === "skill.teaching.stopped") {
               void refreshThread(active.id).catch(() => undefined);
             } else if (isComputerStatusEvent(event)) {
               void refreshComputerScreen(active.id).catch(() => undefined);
@@ -758,6 +788,45 @@ export function ShellPage() {
     await rpc.threads.stop({ botId: id });
     await refreshThreadRef.current(id);
   }, []);
+  const stopTeaching = useCallback(async () => {
+    const id = activeBotId.current;
+    if (!id || teachBusy) return;
+    const recording = taughtSkills.find(
+      (skill) => skill.status === "recording" && taughtSkillsBotId === id,
+    );
+    if (!recording) return;
+    setTeachBusy(true);
+    try {
+      await rpc.skills.stop({ skillId: recording.id });
+      await refreshThreadRef.current(id);
+      setComputerOpen(false);
+    } finally {
+      setTeachBusy(false);
+    }
+  }, [teachBusy, taughtSkills, taughtSkillsBotId]);
+  // Transcript and MessageView are memoized; these must stay referentially stable or every
+  // Shell state change re-renders the whole transcript.
+  const refreshActiveThread = useCallback(async () => {
+    const id = activeBotId.current;
+    if (!id) return;
+    await refreshThreadRef.current(id);
+  }, []);
+  const addSkillRoutine = useCallback((name: string, prompt: string) => {
+    setRoutineDraft({ name, prompt, schedule: defaultCronPreset() });
+    setEditingRoutine(null);
+    setPanel("routine");
+  }, []);
+  const speakingMessageIdRef = useRef(speakingMessageId);
+  speakingMessageIdRef.current = speakingMessageId;
+  const speakMessage = useCallback((message: ThreadMessage) => {
+    if (speakingMessageIdRef.current === message.id) {
+      speaker.stop();
+      return;
+    }
+    const text = speechFromBlocks(message.blocks);
+    const id = activeBotId.current;
+    if (text && id) void speaker.speak(text, { botId: id, messageId: message.id });
+  }, []);
 
   async function createBot(input: {
     name: string;
@@ -1014,19 +1083,7 @@ export function ShellPage() {
           className="mx-3 mb-1 flex items-center gap-3 rounded-[11px] px-2.5 py-2 hover:bg-[#131315]"
         >
           <span className="grid h-[30px] w-[30px] place-items-center rounded-full bg-[#17171A] text-[#9A9AA0]">
-            <svg
-              width="15"
-              height="15"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.7"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden="true"
-            >
-              <path d="M4 7h3a1 1 0 0 0 1-1 1.5 1.5 0 1 1 3 0 1 1 0 0 0 1 1h3v3a1 1 0 0 0 1 1 1.5 1.5 0 1 1 0 3 1 1 0 0 0-1 1v3h-3a1 1 0 0 0-1 1 1.5 1.5 0 1 1-3 0 1 1 0 0 0-1-1H4v-3a1 1 0 0 0-1-1 1.5 1.5 0 1 1 0-3 1 1 0 0 0 1-1z" />
-            </svg>
+            <Puzzle size={15} strokeWidth={1.7} />
           </span>
           <span className="text-[14.5px] text-[#C9C9CE]">Plugins</span>
         </button>
@@ -1041,7 +1098,7 @@ export function ShellPage() {
                 }}
                 className="flex w-full items-center gap-3 rounded-[11px] px-3 py-2.5 hover:bg-[#232327]"
               >
-                <span className="text-[#9A9AA0]">⌁</span>
+                <Cpu size={16} strokeWidth={1.7} className="text-[#9A9AA0]" />
                 <span className="flex-1 text-left text-[14.5px] text-[#ECECEE]">Models</span>
               </button>
               <button
@@ -1063,7 +1120,7 @@ export function ShellPage() {
                 }}
                 className="flex w-full items-center gap-3 rounded-[11px] px-3 py-2.5 hover:bg-[#232327]"
               >
-                <span className="text-[#9A9AA0]">♫</span>
+                <Volume2 size={16} strokeWidth={1.7} className="text-[#9A9AA0]" />
                 <span className="flex-1 text-left text-[14.5px] text-[#ECECEE]">Voice</span>
               </button>
               <button
@@ -1073,7 +1130,7 @@ export function ShellPage() {
                   setUsage(await rpc.usage.summary());
                 }}
               >
-                <span className="text-[#9A9AA0]">◔</span>
+                <Gauge size={16} strokeWidth={1.7} className="text-[#9A9AA0]" />
                 <span className="flex-1 text-left text-[14.5px] text-[#ECECEE]">Weekly usage</span>
               </button>
               {usage ? (
@@ -1086,7 +1143,7 @@ export function ShellPage() {
                 onClick={() => void authClient.signOut().then(() => navigate("/"))}
                 className="flex w-full items-center gap-3 rounded-[11px] px-3 py-2.5 hover:bg-[#232327]"
               >
-                <span className="text-[#9A9AA0]">⇤</span>
+                <LogOut size={16} strokeWidth={1.7} className="text-[#9A9AA0]" />
                 <span className="text-[14.5px] text-[#ECECEE]">Log out</span>
               </button>
             </div>
@@ -1135,16 +1192,7 @@ export function ShellPage() {
                 className="grid h-[30px] w-[34px] place-items-center rounded-[9px] hover:bg-[#1B1B1E]"
                 style={{ background: callOpen ? "#1B1B1E" : "transparent" }}
               >
-                <svg
-                  width="16"
-                  height="16"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="#A8A8AD"
-                  strokeWidth="1.6"
-                >
-                  <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.79 19.79 0 0 1 2.12 4.18 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.35 1.9.66 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.31 1.85.53 2.81.66A2 2 0 0 1 22 16.92z" />
-                </svg>
+                <Phone size={16} strokeWidth={1.6} className="text-[#A8A8AD]" />
               </button>
             ) : null}
             <button
@@ -1154,17 +1202,7 @@ export function ShellPage() {
               className="grid h-[30px] w-[34px] place-items-center rounded-[9px] hover:bg-[#1B1B1E]"
               style={{ background: panel ? "#1B1B1E" : "transparent" }}
             >
-              <svg
-                width="18"
-                height="18"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="#A8A8AD"
-                strokeWidth="1.6"
-              >
-                <rect x="2" y="4" width="20" height="13" rx="2" />
-                <path d="M8 21h8M12 17v4" />
-              </svg>
+              <Monitor size={18} strokeWidth={1.6} className="text-[#A8A8AD]" />
             </button>
           </div>
         </div>
@@ -1181,21 +1219,21 @@ export function ShellPage() {
           onLoadOlder={loadOlder}
           onOpenBot={openBot}
           onAnswer={answerMessage}
+          onRefresh={refreshActiveThread}
+          onAddRoutine={addSkillRoutine}
           voiceReady={Boolean(voiceStatus?.ready)}
           speakingMessageId={speakingMessageId}
-          onSpeak={(message) => {
-            if (speakingMessageId === message.id) {
-              speaker.stop();
-              return;
-            }
-            const text = speechFromBlocks(message.blocks);
-            if (text && active)
-              void speaker.speak(text, { botId: active.id, messageId: message.id });
-          }}
+          onSpeak={speakMessage}
         />
+        {recordingSkill ? (
+          <div className="px-6 pb-2 text-center text-[13px] text-[#E65707]">
+            Teaching in progress — stop teaching before sending a new message.
+          </div>
+        ) : null}
         <Composer
           activeName={active?.name}
           running={Boolean(snapshot?.run && isActive(snapshot.run.status))}
+          disabled={Boolean(recordingSkill)}
           pendingAttachments={activePendingAttachments}
           attachmentNotice={attachmentNotice}
           sendError={sendError}
@@ -1239,10 +1277,10 @@ export function ShellPage() {
                     aria-label="Bot settings"
                     onClick={() => setPanel("settings")}
                   >
-                    ⚙
+                    <Settings size={16} strokeWidth={1.7} />
                   </button>
                   <button type="button" aria-label="Close panel" onClick={() => setPanel(null)}>
-                    ✕
+                    <X size={16} strokeWidth={1.8} />
                   </button>
                 </div>
               </div>
@@ -1348,6 +1386,26 @@ export function ShellPage() {
                 >
                   + New routine
                 </button>
+                {active ? (
+                  <TeachComputerSection
+                    botId={active.id}
+                    computer={computer}
+                    skills={activeTaughtSkills}
+                    busy={teachBusy}
+                    onRefresh={refreshActiveThread}
+                    onOpenComputer={openComputer}
+                    onStopTeaching={stopTeaching}
+                    onAddRoutine={(skill) => {
+                      setRoutineDraft({
+                        name: skill.name || skill.goal.slice(0, 80),
+                        prompt: `Run taught skill: ${skill.name || skill.goal}\n${skill.playbook.steps.map((step, index) => `${index + 1}. ${step}`).join("\n")}`,
+                        schedule: defaultCronPreset(),
+                      });
+                      setEditingRoutine(null);
+                      setPanel("routine");
+                    }}
+                  />
+                ) : null}
               </div>
             ) : null}
             {panel === "create" ? (
@@ -1393,11 +1451,11 @@ export function ShellPage() {
                     onClick={() => setPanel("computer")}
                     className="text-[#9A9AA0]"
                   >
-                    ‹
+                    <ChevronLeft size={18} strokeWidth={1.8} />
                   </button>
                   <div className="text-[15.5px] font-medium text-[#F1F1F2]">Routine</div>
                   <button type="button" onClick={() => setPanel(null)} className="text-[#6C6C70]">
-                    ✕
+                    <X size={16} strokeWidth={1.8} />
                   </button>
                 </div>
                 <label className="text-[14px] text-[#85858A]">
@@ -1650,19 +1708,32 @@ export function ShellPage() {
       ) : computerOpen && active ? (
         <div className="absolute inset-0 z-30 flex flex-col bg-[#050506]">
           <div className="flex items-center justify-between gap-4 border-b border-[#171719] px-[18px] py-3.5">
-            <div className="flex min-w-0 items-center gap-3">
+            <div className="flex min-w-0 flex-1 items-center gap-3">
               <BotAvatar color={active.color} size={28} />
-              <span className="truncate text-[15.5px] font-medium text-[#ECECEE]">
-                {computerLabel(computer?.mode, active.name)}
-              </span>
-              {computer?.controlHolder === "user" && computer.controlBotId === active.id ? (
+              {recordingSkill ? (
+                <TeachRecordingChrome
+                  recording={recordingSkill}
+                  busy={teachBusy}
+                  onStop={stopTeaching}
+                  variant="overlay"
+                />
+              ) : (
+                <span className="truncate text-[15.5px] font-medium text-[#ECECEE]">
+                  {computerLabel(computer?.mode, active.name)}
+                </span>
+              )}
+              {!recordingSkill &&
+              computer?.controlHolder === "user" &&
+              computer.controlBotId === active.id ? (
                 <span className="rounded-full bg-[rgba(48,162,75,.14)] px-[11px] py-1 text-[13px] text-[#4ECB71]">
                   You have control
                 </span>
               ) : null}
             </div>
             <div className="flex items-center gap-3">
-              {computer?.controlHolder === "user" && computer.controlBotId === active.id ? (
+              {recordingSkill ? (
+                <TeachStopButton busy={teachBusy} onStop={stopTeaching} />
+              ) : computer?.controlHolder === "user" && computer.controlBotId === active.id ? (
                 <Button
                   type="button"
                   variant="outline"
@@ -1687,30 +1758,42 @@ export function ShellPage() {
                 aria-label="Close computer"
                 onClick={() => setComputerOpen(false)}
               >
-                ✕
+                <X size={16} strokeWidth={1.8} />
               </button>
             </div>
           </div>
-          <div className="min-h-0 flex-1 bg-[#0E0E10]">
+          <div className="relative min-h-0 flex-1 bg-[#0E0E10]">
             {computer?.kind === "desktop" ? (
               <div className="grid h-full place-items-center px-8 text-center text-sm text-[#6C6C70]">
                 This bot runs on this computer. There is no separate Linux desktop. Ask it to use
                 the shell; working directories under your home folder are allowed.
               </div>
             ) : computer?.state === "running" && embeddedScreenUrl ? (
-              <iframe
-                title="Bot screen"
-                src={embeddedScreenUrl}
-                sandbox={screenIframeSandbox(embeddedScreenUrl)}
-                className="h-full w-full border-0 bg-black"
-                allow="clipboard-read; clipboard-write; fullscreen"
-                style={{
-                  pointerEvents:
-                    computer?.controlHolder === "user" && computer.controlBotId === active.id
-                      ? "auto"
-                      : "none",
-                }}
-              />
+              <>
+                <iframe
+                  title="Bot screen"
+                  src={embeddedScreenUrl}
+                  sandbox={screenIframeSandbox(embeddedScreenUrl)}
+                  className="h-full w-full border-0 bg-black"
+                  allow="clipboard-read; clipboard-write; fullscreen"
+                  style={{
+                    pointerEvents:
+                      recordingSkill ||
+                      !(computer?.controlHolder === "user" && computer.controlBotId === active.id)
+                        ? "none"
+                        : "auto",
+                  }}
+                />
+                {active ? (
+                  <TeachCaptureOverlay
+                    botId={active.id}
+                    skill={recordingSkill}
+                    enabled={Boolean(recordingSkill)}
+                    screenWidth={computer?.screenWidth}
+                    screenHeight={computer?.screenHeight}
+                  />
+                ) : null}
+              </>
             ) : (
               <div className="grid h-full place-items-center text-sm text-[#6C6C70]">
                 {computer?.state === "suspended"
@@ -1736,6 +1819,8 @@ const Transcript = memo(function Transcript({
   onLoadOlder,
   onOpenBot,
   onAnswer,
+  onRefresh,
+  onAddRoutine,
   voiceReady,
   speakingMessageId,
   onSpeak,
@@ -1750,6 +1835,8 @@ const Transcript = memo(function Transcript({
   onLoadOlder: () => void | Promise<void>;
   onOpenBot: (botId: string) => void;
   onAnswer: (message: ThreadMessage, text: string) => Promise<void>;
+  onRefresh: () => Promise<void>;
+  onAddRoutine: (name: string, prompt: string) => void;
   voiceReady: boolean;
   speakingMessageId: string | null;
   onSpeak: (message: ThreadMessage) => void;
@@ -1778,6 +1865,8 @@ const Transcript = memo(function Transcript({
             canAnswer={message.id === answerableAskMessageId}
             onOpenBot={onOpenBot}
             onAnswer={onAnswer}
+            onRefresh={onRefresh}
+            onAddRoutine={onAddRoutine}
             voiceReady={voiceReady}
             speaking={speakingMessageId === message.id}
             onSpeak={() => onSpeak(message)}
@@ -1801,6 +1890,7 @@ const Transcript = memo(function Transcript({
 const Composer = memo(function Composer({
   activeName,
   running,
+  disabled,
   pendingAttachments,
   attachmentNotice,
   sendError,
@@ -1818,6 +1908,7 @@ const Composer = memo(function Composer({
 }: {
   activeName?: string;
   running: boolean;
+  disabled?: boolean;
   pendingAttachments: PendingAttachment[];
   attachmentNotice: string | null;
   sendError: string | null;
@@ -1837,7 +1928,7 @@ const Composer = memo(function Composer({
   const canSend = draft.trim().length > 0 || pendingAttachments.length > 0;
 
   function send() {
-    if (!canSend || sending) return;
+    if (!canSend || sending || disabled) return;
     const text = draft;
     setDraft("");
     void onSend(text);
@@ -1869,7 +1960,7 @@ const Composer = memo(function Composer({
                   className="h-8 w-8 rounded object-cover"
                 />
               ) : (
-                <span>📎</span>
+                <Paperclip size={14} strokeWidth={1.8} />
               )}
               <span className="max-w-[180px] truncate">{attachment.file.name}</span>
               <button
@@ -1878,7 +1969,7 @@ const Composer = memo(function Composer({
                 onClick={() => onRemoveAttachment(attachment)}
                 className="text-[#85858A] hover:text-[#ECECEE]"
               >
-                ✕
+                <X size={13} strokeWidth={2} />
               </button>
             </div>
           ))}
@@ -1896,10 +1987,11 @@ const Composer = memo(function Composer({
         <button
           type="button"
           aria-label="Attach file"
+          disabled={disabled}
           onClick={() => fileInputRef.current?.click()}
-          className="grid h-[34px] w-[34px] shrink-0 place-items-center rounded-full border border-[#26262A] text-[18px] text-[#9A9AA0]"
+          className="grid h-[34px] w-[34px] shrink-0 place-items-center rounded-full border border-[#26262A] text-[#9A9AA0] disabled:opacity-40"
         >
-          +
+          <Plus size={17} strokeWidth={1.8} />
         </button>
         <button
           type="button"
@@ -1917,14 +2009,14 @@ const Composer = memo(function Composer({
             onDictateStart((text) => setDraft((current) => `${current} ${text}`.trim()));
           }}
           onTouchEnd={onDictateStop}
-          className={`grid h-[34px] w-[34px] shrink-0 place-items-center rounded-full border text-[15px] ${
+          className={`grid h-[34px] w-[34px] shrink-0 place-items-center rounded-full border ${
             dictating
               ? "border-[#4ECB71] bg-[rgba(48,162,75,.16)] text-[#4ECB71]"
               : "border-[#26262A] text-[#9A9AA0]"
           }`}
           title={transcribe ? "Hold to talk" : "Hold to talk (on-device dictation)"}
         >
-          ⌇
+          <Mic size={16} strokeWidth={1.8} />
         </button>
         <input
           value={draft}
@@ -1935,10 +2027,11 @@ const Composer = memo(function Composer({
               send();
             }
           }}
+          disabled={disabled}
           placeholder={activeName ? `Message ${activeName}` : "Message…"}
           name="chat-message"
           autoComplete="off"
-          className="flex-1 bg-transparent text-[15.5px] text-[#E9E9EA] outline-none"
+          className="flex-1 bg-transparent text-[15.5px] text-[#E9E9EA] outline-none disabled:opacity-40"
         />
         {running ? (
           <button
@@ -1947,17 +2040,17 @@ const Composer = memo(function Composer({
             onClick={() => void onStop()}
             className="grid h-9 w-9 place-items-center rounded-full bg-[#F1F1EF] text-[#17171A]"
           >
-            ■
+            <Square size={12} strokeWidth={0} fill="currentColor" />
           </button>
         ) : (
           <button
             type="button"
             aria-label="Send"
-            disabled={sending || !canSend}
+            disabled={sending || !canSend || disabled}
             onClick={send}
             className="grid h-9 w-9 place-items-center rounded-full bg-[#F1F1EF] text-[#17171A] disabled:opacity-50"
           >
-            ↑
+            <ArrowUp size={18} strokeWidth={2} />
           </button>
         )}
       </div>
@@ -1996,6 +2089,8 @@ const MessageView = memo(function MessageView({
   message,
   onAnswer,
   onOpenBot,
+  onRefresh,
+  onAddRoutine,
   voiceReady,
   speaking,
   onSpeak,
@@ -2005,6 +2100,8 @@ const MessageView = memo(function MessageView({
   message: ThreadMessage;
   onAnswer: (message: ThreadMessage, text: string) => Promise<void>;
   onOpenBot: (botId: string) => void;
+  onRefresh: () => Promise<void>;
+  onAddRoutine: (name: string, prompt: string) => void;
   voiceReady: boolean;
   speaking: boolean;
   onSpeak: () => void;
@@ -2285,6 +2382,13 @@ const MessageView = memo(function MessageView({
             />
           );
         }
+        if (block.kind === "skill_draft") {
+          return (
+            <div key={i} className="flex justify-start">
+              <SkillDraftCard block={block} onRefresh={onRefresh} onAddRoutine={onAddRoutine} />
+            </div>
+          );
+        }
         if (block.kind === "computer") {
           return (
             <div
@@ -2464,7 +2568,7 @@ function CreateBotForm({
       <div className="mb-4 flex items-center justify-between">
         <span className="text-[13.5px] text-[#85858A]">New bot</span>
         <button type="button" onClick={onCancel}>
-          ✕
+          <X size={16} strokeWidth={1.8} />
         </button>
       </div>
       <label className="mt-6 block text-[14px] text-[#85858A]">
