@@ -25,6 +25,7 @@ import {
   hasActiveComputerControl,
   listPiCatalog,
   type PiOAuthLogins,
+  probeSupermemory,
   provisionComputer,
   releaseComputerExecutionLease,
   resolveBotWorkspacePath,
@@ -52,6 +53,7 @@ import {
   createRepos,
   createThreadMessage,
   findDefaultModelCredential,
+  findWorkspaceMemoryConfig,
   IsolationError,
   newestModelCredentialOrder,
   Prisma,
@@ -299,6 +301,7 @@ export function createRouter(deps: RouterDeps) {
             notifyOnFinish: input.notifyOnFinish,
             color: input.color,
             pinned: input.pinned,
+            memoryScope: input.memoryScope,
           },
         });
         const bots = await repos.listBots(context.actor);
@@ -1096,6 +1099,21 @@ export function createRouter(deps: RouterDeps) {
         });
         return docs.map((d) => `# ${d.path}\n\n${d.content}`).join("\n\n");
       }),
+      supermemoryConfig: authed.memory.supermemoryConfig.handler(async ({ context }) => {
+        const config = await findWorkspaceMemoryConfig(deps.prisma, context.actor.workspaceId);
+        return config ? serializeWorkspaceMemoryConfig(config, true) : null;
+      }),
+      connectSupermemory: authed.memory.connectSupermemory.handler(async ({ context, input }) =>
+        persistSupermemoryConfig(deps, context.actor, input),
+      ),
+      disconnectSupermemory: authed.memory.disconnectSupermemory.handler(async ({ context }) => {
+        const existing = await findWorkspaceMemoryConfig(deps.prisma, context.actor.workspaceId);
+        if (existing) {
+          await deps.prisma.workspaceMemoryConfig.delete({ where: { id: existing.id } });
+          await deps.prisma.secret.deleteMany({ where: { id: existing.secretId } });
+        }
+        return { ok: true as const };
+      }),
     },
     routines: {
       list: authed.routines.list.handler(async ({ context, input }) => {
@@ -1810,6 +1828,79 @@ async function persistModelCredential(
     label: cred.label,
     hasKey: true,
     isDefault: true,
+  };
+}
+
+const SUPERMEMORY_CLOUD_BASE_URL = "https://api.supermemory.ai";
+
+export async function persistSupermemoryConfig(
+  deps: RouterDeps,
+  actor: Actor,
+  input: {
+    mode: "cloud" | "local";
+    apiKey: string;
+    baseUrl?: string;
+    defaultMemoryScope: "isolated" | "shared";
+  },
+) {
+  if (input.mode === "local" && !input.baseUrl) {
+    throw new ORPCError("BAD_REQUEST", { message: "baseUrl is required for local mode" });
+  }
+  const baseUrl = input.mode === "cloud" ? SUPERMEMORY_CLOUD_BASE_URL : input.baseUrl!;
+  const probe = await probeSupermemory({ baseUrl, apiKey: input.apiKey });
+  if (!probe.ok) {
+    throw new ORPCError("BAD_REQUEST", { message: probe.error });
+  }
+  const stored = await deps.secrets.put(input.apiKey, {
+    operationId: "supermemory-config",
+    traceId: "supermemory-config",
+    workspaceId: actor.workspaceId,
+    userId: actor.userId,
+    signal: new AbortController().signal,
+  });
+  const existing = await findWorkspaceMemoryConfig(deps.prisma, actor.workspaceId);
+  const secret = await deps.prisma.secret.create({
+    data: {
+      id: stored.id,
+      userId: actor.userId,
+      workspaceId: actor.workspaceId,
+      kind: "supermemory",
+      ciphertext: stored.ciphertext,
+    },
+  });
+  const config = await deps.prisma.workspaceMemoryConfig.upsert({
+    where: { workspaceId: actor.workspaceId },
+    create: {
+      workspaceId: actor.workspaceId,
+      userId: actor.userId,
+      mode: input.mode,
+      baseUrl,
+      secretId: secret.id,
+      defaultMemoryScope: input.defaultMemoryScope,
+    },
+    update: {
+      mode: input.mode,
+      baseUrl,
+      secretId: secret.id,
+      defaultMemoryScope: input.defaultMemoryScope,
+    },
+  });
+  if (existing && existing.secretId !== secret.id) {
+    await deps.prisma.secret.deleteMany({ where: { id: existing.secretId } });
+  }
+  return serializeWorkspaceMemoryConfig(config, true);
+}
+
+function serializeWorkspaceMemoryConfig(
+  config: { mode: string; baseUrl: string; defaultMemoryScope: string; updatedAt: Date },
+  connected: boolean,
+) {
+  return {
+    mode: config.mode as "cloud" | "local",
+    baseUrl: config.baseUrl,
+    defaultMemoryScope: config.defaultMemoryScope as "isolated" | "shared",
+    connected,
+    updatedAt: config.updatedAt.toISOString(),
   };
 }
 

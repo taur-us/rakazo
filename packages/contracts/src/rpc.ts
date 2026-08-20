@@ -14,6 +14,7 @@ import {
   DeploymentSettingsSchema,
   ExportManifestSchema,
   MemoryDocumentSchema,
+  MemoryScopeSchema,
   MeSchema,
   ModelCatalogEntrySchema,
   ModelCredentialSchema,
@@ -22,6 +23,7 @@ import {
   ThreadSnapshotSchema,
   UpdateBotInput,
   UsageRecordSchema,
+  WorkspaceMemoryConfigSchema,
 } from "./domain.js";
 import { ProductEventSchema } from "./events.js";
 import { Id } from "./ids.js";
@@ -165,6 +167,18 @@ export const appContract = {
       .input(z.object({ documentId: Id, content: z.string() }))
       .output(MemoryDocumentSchema),
     exportMarkdown: oc.input(z.object({ botId: Id.optional() })).output(z.string()),
+    supermemoryConfig: oc.output(WorkspaceMemoryConfigSchema.nullable()),
+    connectSupermemory: oc
+      .input(
+        z.object({
+          mode: z.enum(["cloud", "local"]),
+          apiKey: z.string().min(8),
+          baseUrl: z.string().url().optional(),
+          defaultMemoryScope: MemoryScopeSchema.default("isolated"),
+        }),
+      )
+      .output(WorkspaceMemoryConfigSchema),
+    disconnectSupermemory: oc.output(z.object({ ok: z.literal(true) })),
   },
   routines: {
     list: oc.input(botId).output(z.array(RoutineSchema)),

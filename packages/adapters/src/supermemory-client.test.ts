@@ -1,105 +1,93 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  saveSupermemoryMemory,
-  searchSupermemory,
-  supermemoryContainerTag,
-} from "./supermemory-client.js";
+import { describe, expect, it, vi } from "vitest";
+import { probeSupermemory, saveSupermemoryMemory, searchSupermemory } from "./supermemory-client.js";
 
-describe("supermemory client", () => {
-  const previousApiKey = process.env.SUPERMEMORY_API_KEY;
-  const previousBaseUrl = process.env.SUPERMEMORY_API_URL;
+const config = { baseUrl: "http://localhost:6767", apiKey: "sm_test_key" };
 
-  beforeEach(() => {
-    process.env.SUPERMEMORY_API_KEY = "sm_test_key";
-    process.env.SUPERMEMORY_API_URL = "http://localhost:6767";
-  });
+describe("searchSupermemory", () => {
+  it("posts the query and container tag, returning search results on success", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ results: [{ memory: "User prefers British English", similarity: 0.9 }] }),
+        { status: 200 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
 
-  afterEach(() => {
+    const result = await searchSupermemory("spelling preference", "rakazo:bot-123", config);
+
+    expect(result).toEqual({
+      ok: true,
+      results: [{ memory: "User prefers British English", similarity: 0.9 }],
+    });
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("http://localhost:6767/v4/search");
+    expect(init.headers.Authorization).toBe("Bearer sm_test_key");
+    expect(JSON.parse(init.body)).toEqual({
+      q: "spelling preference",
+      containerTags: ["rakazo:bot-123"],
+    });
     vi.unstubAllGlobals();
-    if (previousApiKey === undefined) delete process.env.SUPERMEMORY_API_KEY;
-    else process.env.SUPERMEMORY_API_KEY = previousApiKey;
-    if (previousBaseUrl === undefined) delete process.env.SUPERMEMORY_API_URL;
-    else process.env.SUPERMEMORY_API_URL = previousBaseUrl;
   });
 
-  describe("supermemoryContainerTag", () => {
-    it("scopes the tag to the bot id", () => {
-      expect(supermemoryContainerTag("bot-123")).toBe("rakazo:bot-123");
-    });
+  it("reports a non-OK response instead of throwing", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 500 })));
+    const result = await searchSupermemory("anything", "rakazo:bot-123", config);
+    expect(result).toEqual({ ok: false, error: expect.stringContaining("500") });
+    vi.unstubAllGlobals();
   });
 
-  describe("searchSupermemory", () => {
-    it("reports when Supermemory is not configured", async () => {
-      delete process.env.SUPERMEMORY_API_KEY;
-      const result = await searchSupermemory("voice of customer", "rakazo:bot-123");
-      expect(result).toEqual({ ok: false, error: expect.stringContaining("not configured") });
+  it("reports an unreachable server instead of throwing", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("connect ECONNREFUSED")));
+    const result = await searchSupermemory("anything", "rakazo:bot-123", config);
+    expect(result).toEqual({ ok: false, error: expect.stringContaining("unreachable") });
+    vi.unstubAllGlobals();
+  });
+});
+
+describe("saveSupermemoryMemory", () => {
+  it("posts the content and container tag on success", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await saveSupermemoryMemory("User prefers British English", "rakazo:bot-123", config);
+
+    expect(result).toEqual({ ok: true });
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("http://localhost:6767/v4/memories");
+    expect(JSON.parse(init.body)).toEqual({
+      containerTag: "rakazo:bot-123",
+      memories: [{ content: "User prefers British English", isStatic: false }],
     });
-
-    it("posts the query and container tag, returning search results on success", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(
-        new Response(
-          JSON.stringify({
-            results: [{ memory: "User prefers British English", similarity: 0.9 }],
-          }),
-          { status: 200 },
-        ),
-      );
-      vi.stubGlobal("fetch", fetchMock);
-
-      const result = await searchSupermemory("spelling preference", "rakazo:bot-123");
-
-      expect(result).toEqual({
-        ok: true,
-        results: [{ memory: "User prefers British English", similarity: 0.9 }],
-      });
-      const [url, init] = fetchMock.mock.calls[0]!;
-      expect(url).toBe("http://localhost:6767/v4/search");
-      expect(init.headers.Authorization).toBe("Bearer sm_test_key");
-      expect(JSON.parse(init.body)).toEqual({
-        q: "spelling preference",
-        containerTags: ["rakazo:bot-123"],
-      });
-    });
-
-    it("reports a non-OK response instead of throwing", async () => {
-      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 500 })));
-      const result = await searchSupermemory("anything", "rakazo:bot-123");
-      expect(result).toEqual({ ok: false, error: expect.stringContaining("500") });
-    });
-
-    it("reports an unreachable server instead of throwing", async () => {
-      vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("connect ECONNREFUSED")));
-      const result = await searchSupermemory("anything", "rakazo:bot-123");
-      expect(result).toEqual({ ok: false, error: expect.stringContaining("unreachable") });
-    });
+    vi.unstubAllGlobals();
   });
 
-  describe("saveSupermemoryMemory", () => {
-    it("reports when Supermemory is not configured", async () => {
-      delete process.env.SUPERMEMORY_API_KEY;
-      const result = await saveSupermemoryMemory("fact", "rakazo:bot-123");
-      expect(result).toEqual({ ok: false, error: expect.stringContaining("not configured") });
-    });
+  it("reports a non-OK response instead of throwing", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 401 })));
+    const result = await saveSupermemoryMemory("fact", "rakazo:bot-123", config);
+    expect(result).toEqual({ ok: false, error: expect.stringContaining("401") });
+    vi.unstubAllGlobals();
+  });
+});
 
-    it("posts the content and container tag on success", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response("", { status: 200 }));
-      vi.stubGlobal("fetch", fetchMock);
+describe("probeSupermemory", () => {
+  it("succeeds when the container-tags endpoint responds", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("[]", { status: 200 })));
+    const result = await probeSupermemory(config);
+    expect(result).toEqual({ ok: true });
+    vi.unstubAllGlobals();
+  });
 
-      const result = await saveSupermemoryMemory("User prefers British English", "rakazo:bot-123");
+  it("fails when the endpoint rejects the key", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 401 })));
+    const result = await probeSupermemory(config);
+    expect(result).toEqual({ ok: false, error: expect.stringContaining("401") });
+    vi.unstubAllGlobals();
+  });
 
-      expect(result).toEqual({ ok: true });
-      const [url, init] = fetchMock.mock.calls[0]!;
-      expect(url).toBe("http://localhost:6767/v4/memories");
-      expect(JSON.parse(init.body)).toEqual({
-        containerTag: "rakazo:bot-123",
-        memories: [{ content: "User prefers British English", isStatic: false }],
-      });
-    });
-
-    it("reports a non-OK response instead of throwing", async () => {
-      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 401 })));
-      const result = await saveSupermemoryMemory("fact", "rakazo:bot-123");
-      expect(result).toEqual({ ok: false, error: expect.stringContaining("401") });
-    });
+  it("fails when nothing is listening", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("connect ECONNREFUSED")));
+    const result = await probeSupermemory(config);
+    expect(result).toEqual({ ok: false, error: expect.stringContaining("unreachable") });
+    vi.unstubAllGlobals();
   });
 });

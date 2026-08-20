@@ -1,4 +1,3 @@
-const DEFAULT_SUPERMEMORY_BASE_URL = "http://localhost:6767";
 const SUPERMEMORY_TIMEOUT_MS = 15_000;
 
 export interface SupermemoryResult {
@@ -12,35 +11,30 @@ export type SupermemorySearchResponse =
   | { ok: false; error: string };
 
 export type SupermemorySaveResponse = { ok: true } | { ok: false; error: string };
+export type SupermemoryProbeResponse = { ok: true } | { ok: false; error: string };
 
-/** Every bot gets its own container tag, mirroring the existing bot-scoped memory model. */
-export function supermemoryContainerTag(botId: string): string {
-  return `rakazo:${botId}`;
-}
-
-function supermemoryConfig(): { baseUrl: string; apiKey: string } | undefined {
-  const apiKey = process.env.SUPERMEMORY_API_KEY;
-  if (!apiKey) return undefined;
-  const baseUrl = (process.env.SUPERMEMORY_API_URL ?? DEFAULT_SUPERMEMORY_BASE_URL).replace(/\/+$/, "");
-  return { baseUrl, apiKey };
+export interface SupermemoryConnectionConfig {
+  baseUrl: string;
+  apiKey: string;
 }
 
 function unreachableError(error: unknown): string {
   return `Supermemory is unreachable: ${error instanceof Error ? error.message : String(error)}`;
 }
 
+function authHeaders(config: SupermemoryConnectionConfig): Record<string, string> {
+  return { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" };
+}
+
 export async function searchSupermemory(
   query: string,
   containerTag: string,
+  config: SupermemoryConnectionConfig,
 ): Promise<SupermemorySearchResponse> {
-  const config = supermemoryConfig();
-  if (!config) {
-    return { ok: false, error: "Supermemory is not configured (SUPERMEMORY_API_KEY is unset)." };
-  }
   try {
     const response = await fetch(`${config.baseUrl}/v4/search`, {
       method: "POST",
-      headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
+      headers: authHeaders(config),
       body: JSON.stringify({ q: query, containerTags: [containerTag] }),
       signal: AbortSignal.timeout(SUPERMEMORY_TIMEOUT_MS),
     });
@@ -57,20 +51,35 @@ export async function searchSupermemory(
 export async function saveSupermemoryMemory(
   content: string,
   containerTag: string,
+  config: SupermemoryConnectionConfig,
 ): Promise<SupermemorySaveResponse> {
-  const config = supermemoryConfig();
-  if (!config) {
-    return { ok: false, error: "Supermemory is not configured (SUPERMEMORY_API_KEY is unset)." };
-  }
   try {
     const response = await fetch(`${config.baseUrl}/v4/memories`, {
       method: "POST",
-      headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
+      headers: authHeaders(config),
       body: JSON.stringify({ containerTag, memories: [{ content, isStatic: false }] }),
       signal: AbortSignal.timeout(SUPERMEMORY_TIMEOUT_MS),
     });
     if (!response.ok) {
       return { ok: false, error: `Supermemory save failed: ${response.status}` };
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: unreachableError(error) };
+  }
+}
+
+export async function probeSupermemory(
+  config: SupermemoryConnectionConfig,
+): Promise<SupermemoryProbeResponse> {
+  try {
+    const response = await fetch(`${config.baseUrl}/v3/container-tags/list`, {
+      method: "GET",
+      headers: authHeaders(config),
+      signal: AbortSignal.timeout(SUPERMEMORY_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      return { ok: false, error: `Supermemory rejected the connection: ${response.status}` };
     }
     return { ok: true };
   } catch (error) {

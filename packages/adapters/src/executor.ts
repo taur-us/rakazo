@@ -33,9 +33,12 @@ import {
 } from "@rakazo/core";
 import {
   createThreadMessage,
+  effectiveMemoryScope,
   findDefaultModelCredential,
+  findWorkspaceMemoryConfig,
   type PrismaClient,
   parseComputerMode,
+  supermemoryContainerTagFor,
   type ThreadEvents,
 } from "@rakazo/db";
 import { builtinAgentTools } from "./builtin-tools.js";
@@ -62,6 +65,7 @@ import {
 import { observationToolResult, parseComputerActions } from "./computer-tools.js";
 import { checkpointAndRecordComputerWorkspace } from "./computer-workspace.js";
 import { loadAgentMemoryContext } from "./memory-context.js";
+import { selectMemoryTools } from "./memory-tools.js";
 import { toOAuthCredential } from "./pi-credentials.js";
 import {
   parseModelSecret,
@@ -71,11 +75,7 @@ import {
 } from "./pi-oauth.js";
 import { inferScript } from "./scripted-runtime.js";
 import type { EncryptedSecretStore } from "./secrets.js";
-import {
-  saveSupermemoryMemory,
-  searchSupermemory,
-  supermemoryContainerTag,
-} from "./supermemory-client.js";
+import { saveSupermemoryMemory, searchSupermemory } from "./supermemory-client.js";
 
 const modelCredentialLocks = new Map<string, Promise<void>>();
 const READ_ONLY_AGENT_TOOLS = new Set([
@@ -284,7 +284,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
 
       const runSecrets = [...deps.secrets];
       try {
-        const [bot, thread, messages, task, connectedPlugins, credential, settings] =
+        const [bot, thread, messages, task, connectedPlugins, credential, settings, memoryConfig] =
           await Promise.all([
             deps.prisma.bot.findUniqueOrThrow({
               where: { id: run.botId },
@@ -304,6 +304,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
             }),
             findDefaultModelCredential(deps.prisma, run),
             deps.prisma.deploymentSettings.findUnique({ where: { id: "default" } }),
+            findWorkspaceMemoryConfig(deps.prisma, run.workspaceId),
           ]);
         runAbortController = new AbortController();
         if (!leaseValid) runAbortController.abort();
@@ -345,6 +346,20 @@ export function createRunExecutor(deps: ExecutorDeps) {
           (values) => runSecrets.push(...values),
         );
         runSecrets.push(...resolved.redact);
+        const supermemory = memoryConfig
+          ? {
+              baseUrl: memoryConfig.baseUrl,
+              apiKey: deps.secretStore!.load(
+                (await deps.prisma.secret.findUniqueOrThrow({ where: { id: memoryConfig.secretId } }))
+                  .ciphertext,
+              ),
+              containerTag: supermemoryContainerTagFor(
+                effectiveMemoryScope(bot.memoryScope, memoryConfig.defaultMemoryScope),
+                bot.id,
+                run.workspaceId,
+              ),
+            }
+          : null;
         if (!bot.computer) throw new Error("Bot has no computer");
         const storedComputer = bot.computer;
         const computerMode = parseComputerMode(storedComputer.scope);
@@ -353,9 +368,10 @@ export function createRunExecutor(deps: ExecutorDeps) {
         scheduleComputerSleep(deps.jobs, storedComputer.id);
         const graphical =
           computer.kind !== "desktop" && deps.sandbox.describe().capabilities.graphical;
-        const builtins = graphical
+        const nonGraphical = graphical
           ? builtinAgentTools
           : builtinAgentTools.filter((tool) => !GRAPHICAL_AGENT_TOOLS.has(tool.name));
+        const builtins = selectMemoryTools(nonGraphical, Boolean(memoryConfig));
         const tools = [
           ...builtins,
           ...discovered.filter(
@@ -596,13 +612,14 @@ export function createRunExecutor(deps: ExecutorDeps) {
             return finish({ ok: true });
           }
           if (name === "recall_memory") {
-            return searchSupermemory(String(args.query ?? ""), supermemoryContainerTag(bot.id));
+            return searchSupermemory(String(args.query ?? ""), supermemory!.containerTag, supermemory!);
           }
           if (name === "save_memory") {
             return finish(
               await saveSupermemoryMemory(
                 String(args.content ?? ""),
-                supermemoryContainerTag(bot.id),
+                supermemory!.containerTag,
+                supermemory!,
               ),
             );
           }
