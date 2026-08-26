@@ -103,6 +103,7 @@ import {
   currentTurnFilesInstruction,
   materializeCurrentTurnFiles,
 } from "./thread-artifacts.js";
+import { textContentArg } from "./tool-text.js";
 
 const modelCredentialLocks = new Map<string, Promise<void>>();
 const READ_ONLY_AGENT_TOOLS = new Set([
@@ -364,29 +365,29 @@ export function createRunExecutor(deps: ExecutorDeps) {
           memoryConfig,
           savedSkills,
         ] = await Promise.all([
-            deps.prisma.bot.findUniqueOrThrow({
-              where: { id: run.botId },
-              include: { computer: true },
-            }),
-            deps.prisma.thread.findUniqueOrThrow({ where: { id: run.threadId } }),
-            deps.prisma.message.findMany({
-              where: { threadId: run.threadId },
-              orderBy: { seq: "desc" },
-              take: LEGACY_HISTORY_WINDOW_SIZE,
-              select: { role: true, runId: true, blocks: true },
-            }),
-            deps.prisma.task.findUniqueOrThrow({ where: { id: run.taskId } }),
-            deps.prisma.connection.findMany({
-              where: { userId: run.userId, workspaceId: run.workspaceId },
-              select: { id: true, provider: true, displayName: true, status: true },
-            }),
-            findDefaultModelCredential(deps.prisma, run),
-            deps.prisma.deploymentSettings.findUnique({ where: { id: "default" } }),
-            findWorkspaceMemoryConfig(deps.prisma, run.workspaceId),
-            deps.prisma.taughtSkill.findMany({
-              where: { botId: run.botId, workspaceId: run.workspaceId, status: "saved" },
-            }),
-          ]);
+          deps.prisma.bot.findUniqueOrThrow({
+            where: { id: run.botId },
+            include: { computer: true },
+          }),
+          deps.prisma.thread.findUniqueOrThrow({ where: { id: run.threadId } }),
+          deps.prisma.message.findMany({
+            where: { threadId: run.threadId },
+            orderBy: { seq: "desc" },
+            take: LEGACY_HISTORY_WINDOW_SIZE,
+            select: { role: true, runId: true, blocks: true },
+          }),
+          deps.prisma.task.findUniqueOrThrow({ where: { id: run.taskId } }),
+          deps.prisma.connection.findMany({
+            where: { userId: run.userId, workspaceId: run.workspaceId },
+            select: { id: true, provider: true, displayName: true, status: true },
+          }),
+          findDefaultModelCredential(deps.prisma, run),
+          deps.prisma.deploymentSettings.findUnique({ where: { id: "default" } }),
+          findWorkspaceMemoryConfig(deps.prisma, run.workspaceId),
+          deps.prisma.taughtSkill.findMany({
+            where: { botId: run.botId, workspaceId: run.workspaceId, status: "saved" },
+          }),
+        ]);
         runAbortController = new AbortController();
         if (!leaseValid) runAbortController.abort();
         let liveSlugs: string[] = [];
@@ -668,7 +669,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
           }
           if (name === "write_file") {
             const filePath = String(args.path ?? "notes/result.txt");
-            const content = String(args.content ?? "");
+            const content = textContentArg(args.content, "");
             await deps.sandbox.writeFile(
               computer,
               {

@@ -12,6 +12,7 @@ import type {
 import { builtinAgentTools, DELEGATION_TOOL_NAMES } from "./builtin-tools.js";
 import { withLocalProviders } from "./local-providers.js";
 import { PiRuntimeCredentialStore, toOAuthCredential } from "./pi-credentials.js";
+import { textContentArg } from "./tool-text.js";
 
 const running = new Map<string, AbortController>();
 // Lazy, not module-top-level: ESM import evaluation runs this module's body
@@ -319,7 +320,10 @@ function toAgentTool(tool: ConnectorTool, host: ToolHost, exposedName: string): 
         return { reason: String(raw.reason ?? "I need you on the screen.") };
       }
       if (tool.name === "write_file") {
-        return { path: String(raw.path ?? "notes/result.txt"), content: String(raw.content ?? "") };
+        return {
+          path: String(raw.path ?? "notes/result.txt"),
+          content: textContentArg(raw.content, ""),
+        };
       }
       if (tool.name === "computer_act") {
         return {
